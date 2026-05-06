@@ -18,7 +18,7 @@ Run-TestCase -Category auth -Name 'cross-project state is isolated' -Test {
     # Drop the marker into project A's claude-data
     $null = Invoke-InContainer "Set-Content C:\claude-data\test-marker.txt -Value $marker" -WorkDir $projA
 
-    # Project B should NOT see the marker (separate slug → separate state dir)
+    # Project B should NOT see the marker (separate slug -> separate state dir)
     $outB = Invoke-InContainer 'Test-Path C:\claude-data\test-marker.txt' -WorkDir $projB
     Should-Match $outB 'False' -Because 'project B should not see project A''s claude-data'
 
@@ -58,7 +58,7 @@ Run-TestCase -Category auth -Name 'settings.json changes do NOT cross projects' 
         if (-not (Test-Path (Join-Path $p '.git'))) { git init $p *> $null }
     }
 
-    # Closes the cross-project agent persistence vector — see docs/security.md, Phase 3.
+    # Closes the cross-project agent persistence vector -- see docs/security.md, Phase 3.
     $marker = "settings-marker-$(Get-Random)"
     $cmdA = '$o = @{theme = "x"; agentMarker = "' + $marker + '"}; ' +
             'Set-Content -LiteralPath C:\claude-data\settings.json -Value ($o | ConvertTo-Json)'

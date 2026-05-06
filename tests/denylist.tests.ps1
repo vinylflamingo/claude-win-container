@@ -1,4 +1,4 @@
-# Denylist tests — host-side checks; no container start required.
+# Denylist tests -- host-side checks; no container start required.
 # Verifies that 'cwc firewall host-add' refuses denylisted FQDNs at config-write
 # time, and that 'cwc firewall denylist add/remove' round-trips correctly.
 

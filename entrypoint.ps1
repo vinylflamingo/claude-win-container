@@ -1,5 +1,5 @@
 # Container entrypoint. Runs once per container start, then execs the CMD.
-# Idempotent — safe to re-run.
+# Idempotent -- safe to re-run.
 
 $ErrorActionPreference = 'Continue'
 
@@ -60,7 +60,7 @@ function Write-CwcJsonFile([string]$path, $obj) {
 }
 
 # Deep-merge two hashtables. $override wins at every level. Lists are treated as
-# scalars (override replaces base entirely; no element-level merging — semantics get
+# scalars (override replaces base entirely; no element-level merging -- semantics get
 # weird, and Claude's settings shape doesn't need it).
 function Merge-CwcDeep($base, $override) {
     if ($null -eq $override) { return $base }
@@ -81,7 +81,7 @@ function Merge-CwcDeep($base, $override) {
 }
 
 # Compute the delta of $current relative to $base. Returns a hashtable containing
-# only keys that are added or changed in $current. Deletions are NOT represented —
+# only keys that are added or changed in $current. Deletions are NOT represented --
 # acceptable here because (1) the agent persistence threat is additive (writing
 # new keys), not deletive, and (2) "delete a global setting from this project" is
 # a feature we don't need in v1.
@@ -112,11 +112,11 @@ function Get-CwcDelta($base, $current) {
 
 # Auth-vs-project state split. Two binds, narrow sync surface:
 #
-# C:\claude-auth   — global bind, shared across projects.
+# C:\claude-auth   -- global bind, shared across projects.
 #                    Contains ONLY: .credentials.json (OAuth tokens, refreshed by Claude),
 #                    mcp-needs-auth-cache.json (small cache), settings.json (global prefs).
 #
-# C:\claude-data   — per-project bind. Where Claude actually reads/writes everything from.
+# C:\claude-data   -- per-project bind. Where Claude actually reads/writes everything from.
 #                    Includes: per-project sessions, todos, plans, history.jsonl,
 #                    plugins/, cache/, statsig/, telemetry/, settings-project.json (overlay).
 #                    Plugins and caches used to be global; making them per-project closes
@@ -129,7 +129,7 @@ function Get-CwcDelta($base, $current) {
 # (See Phase 3 of the security plan; docs/security.md.)
 #
 # Why copy and not junction? Windows containers don't permit creating reparse points
-# (junctions / symlinks) inside bind-mounted directories — the host filesystem rejects
+# (junctions / symlinks) inside bind-mounted directories -- the host filesystem rejects
 # them with "Access is denied." So we copy in-and-out. Cost is small.
 $authRoot = 'C:\claude-auth'
 $dataRoot = 'C:\claude-data'
@@ -140,7 +140,7 @@ $globalFiles = @(
     'mcp-needs-auth-cache.json'
 )
 
-# Copy whole-file globals: auth → data.
+# Copy whole-file globals: auth -> data.
 foreach ($f in $globalFiles) {
     $src = Join-Path $authRoot $f
     $dst = Join-Path $dataRoot $f
@@ -150,10 +150,10 @@ foreach ($f in $globalFiles) {
 }
 
 # settings.json deep-merge.
-# Global baseline → C:\claude-auth\settings.json (theme, telemetry, autoUpdater, …).
-# Per-project overlay → C:\claude-data\settings-project.json (mcpServers, hooks,
+# Global baseline -> C:\claude-auth\settings.json (theme, telemetry, autoUpdater, ...).
+# Per-project overlay -> C:\claude-data\settings-project.json (mcpServers, hooks,
 # permissions, env, anything project-scoped).
-# Result Claude reads → C:\claude-data\settings.json (merged; project wins on conflict).
+# Result Claude reads -> C:\claude-data\settings.json (merged; project wins on conflict).
 $globalSettings  = Read-CwcJsonFile (Join-Path $authRoot 'settings.json')
 $overlaySettings = Read-CwcJsonFile (Join-Path $dataRoot 'settings-project.json')
 $mergedSettings  = Merge-CwcDeep $globalSettings $overlaySettings
@@ -166,7 +166,7 @@ if ($null -ne $mergedSettings) {
 }
 # Snapshot the global baseline for the exit-time delta computation. We deliberately
 # diff against global (not the merged result) so that anything different from global
-# — whether already in the overlay or newly written this session — flows back into
+# -- whether already in the overlay or newly written this session -- flows back into
 # the per-project overlay, never into global.
 $script:cwcSettingsBaseline = $globalSettings
 
@@ -183,7 +183,7 @@ $script:cwcSettingsBaseline = $globalSettings
 #
 # Override:
 #   CWC_LOCKDOWN_LAN=0          disable the lockdown entirely
-#   CWC_ALLOW_NETS=cidr,cidr,…  re-allow specific subnets (e.g. "192.168.50.0/24")
+#   CWC_ALLOW_NETS=cidr,cidr,...  re-allow specific subnets (e.g. "192.168.50.0/24")
 if ($env:CWC_LOCKDOWN_LAN -ne '0') {
     $primary = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object Status -eq 'Up' | Select-Object -First 1
     if ($primary) {
@@ -221,7 +221,7 @@ if ($env:CWC_LOCKDOWN_LAN -ne '0') {
 }
 
 # Validators duplicated from cwc.ps1's Test-CwcFqdn / Test-CwcHostTarget. Defense in
-# depth — if config was hand-edited to bypass the launcher's validation, we still
+# depth -- if config was hand-edited to bypass the launcher's validation, we still
 # refuse to write garbage into the hosts file. KEEP IN SYNC with cwc.ps1.
 $script:cwcFqdnRegex = '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
 function Test-EntrypointFqdn([string]$fqdn) {
@@ -263,7 +263,7 @@ function Test-EntrypointFqdnDenied([string]$fqdn) {
 }
 
 # Extra hosts (FQDN -> IP / host-gateway).
-# CWC_EXTRA_HOSTS=fqdn:target,fqdn:target — written by the launcher from `cwc firewall
+# CWC_EXTRA_HOSTS=fqdn:target,fqdn:target -- written by the launcher from `cwc firewall
 # host-add`. We append to the container's hosts file at runtime.
 #
 # `host-gateway` is resolved to whatever `host.docker.internal` points to (Docker for
@@ -294,7 +294,7 @@ if ($env:CWC_EXTRA_HOSTS) {
     $rawEntries = if ($env:CWC_EXTRA_HOSTS.Contains(';') -or $env:CWC_EXTRA_HOSTS.Contains('|')) {
         $env:CWC_EXTRA_HOSTS.Split(';')
     } else {
-        # Old comma-separated format — preserve compat for one-shot env overrides.
+        # Old comma-separated format -- preserve compat for one-shot env overrides.
         $env:CWC_EXTRA_HOSTS.Split(',')
     }
 
@@ -321,7 +321,7 @@ if ($env:CWC_EXTRA_HOSTS) {
     # Per-FQDN loopback IP allocation. The hosts file maps fqdn -> 127.0.0.<n>; portproxy
     # forwards listen 127.0.0.<n>:port to target:port. Ports not listed aren't bound on
     # the loopback and so are unreachable via the FQDN. (Direct-IP-to-target on other
-    # ports is still possible — the /32 allow-route below is necessarily all-ports;
+    # ports is still possible -- the /32 allow-route below is necessarily all-ports;
     # see docs/security.md for that limitation.)
     $loopbackCounter = 2
 
@@ -352,7 +352,7 @@ if ($env:CWC_EXTRA_HOSTS) {
             $ports  = @(443, 80)
         }
 
-        # Validate before doing anything else — defense in depth against config bypass.
+        # Validate before doing anything else -- defense in depth against config bypass.
         if (-not (Test-EntrypointFqdn $fqdn)) {
             $skipped += "$fqdn (invalid FQDN format)"
             continue
@@ -362,7 +362,7 @@ if ($env:CWC_EXTRA_HOSTS) {
             continue
         }
         if (Test-EntrypointFqdnDenied $fqdn) {
-            $skipped += "$fqdn (denylisted — would redirect Anthropic auth traffic)"
+            $skipped += "$fqdn (denylisted -- would redirect Anthropic auth traffic)"
             continue
         }
         if ($ports.Count -eq 0) {
@@ -402,7 +402,7 @@ if ($env:CWC_EXTRA_HOSTS) {
         $hostsTarget = if ($useProxy) { $loopback } else { $resolved }
 
         if (-not $portproxyAvailable -and $loopbackCounter -eq 2) {
-            # First fallback entry — no banner repetition needed.
+            # First fallback entry -- no banner repetition needed.
         } elseif (-not $useProxy) {
             $added += "$fqdn -> $resolved (fallback: portproxy unavailable, all ports reachable)"
         }
@@ -418,7 +418,7 @@ if ($env:CWC_EXTRA_HOSTS) {
 
         # Poke /32 hole through the lockdown so traffic to the resolved target IP
         # (whether portproxy's outbound connect or the agent's direct connect in
-        # the fallback case) isn't blackholed. Necessarily all-ports — see
+        # the fallback case) isn't blackholed. Necessarily all-ports -- see
         # docs/security.md for the limitation.
         $isPrivate = $resolved -match '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)'
         if ($isPrivate -and $hostIdx -and $hostDefaultGw -and -not $pokedIPs.ContainsKey($resolved)) {
@@ -436,11 +436,11 @@ if ($env:CWC_EXTRA_HOSTS) {
     }
 }
 
-# Harden — opt-in tamper-resistant watchdog.
+# Harden -- opt-in tamper-resistant watchdog.
 # When CWC_HARDEN=1 we snapshot the routing/hosts/CA state we just set up and spawn
 # a PowerShell background job that re-applies it every 2s. We use Start-Job (in-process
 # runspace) instead of Start-Process because the latter is unreliable in Server Core
-# containers — `-WindowStyle Hidden` requires a GUI subsystem that doesn't exist there,
+# containers -- `-WindowStyle Hidden` requires a GUI subsystem that doesn't exist there,
 # and detaching from the parent has surprises. Start-Job uses PowerShell's own job
 # system, which is built for exactly this kind of long-running background work.
 #
@@ -579,14 +579,14 @@ if ($env:CWC_HARDEN -eq '1' -and $env:CWC_LOCKDOWN_LAN -ne '0') {
         $watchdogJob = $null
     }
 } elseif ($env:CWC_HARDEN -eq '1' -and $env:CWC_LOCKDOWN_LAN -eq '0') {
-    Write-Host "[cwc] harden requested but LOCKDOWN_LAN=0 — nothing to defend, watchdog skipped." -ForegroundColor Yellow
+    Write-Host "[cwc] harden requested but LOCKDOWN_LAN=0 -- nothing to defend, watchdog skipped." -ForegroundColor Yellow
 }
 
 # Hand off to the CMD (claude, powershell, etc.)
 # A subtle PowerShell gotcha here: PowerShell unwraps single-element arrays when an
 # `if`-expression's value is assigned to a variable. So `$rest = if(...) { @($x) }` becomes
-# a scalar string when there's exactly one trailing arg — `@$rest` then splats character-by-
-# character (so `--version` becomes `-`, `-`, `v`, `e`, …). Splitting the assignment per
+# a scalar string when there's exactly one trailing arg -- `@$rest` then splats character-by-
+# character (so `--version` becomes `-`, `-`, `v`, `e`, ...). Splitting the assignment per
 # branch sidesteps the unwrap.
 if ($args.Count -gt 0) {
     $cmd = $args[0]
@@ -612,11 +612,11 @@ if ($watchdogJob) {
 }
 
 # On exit:
-#   1. Copy whole-file globals (auth tokens, MCP-auth cache) data → auth so the
+#   1. Copy whole-file globals (auth tokens, MCP-auth cache) data -> auth so the
 #      next session sees refreshed tokens.
 #   2. Compute the delta between this session's settings.json and the global
 #      baseline; write the delta to the per-project overlay. NEVER touch global
-#      settings.json from a session — that's how project A's agent persisted into
+#      settings.json from a session -- that's how project A's agent persisted into
 #      project B's session in the old design.
 #   3. Plugins/caches are no longer synced. They're per-project; Claude regenerates
 #      caches as needed, plugins live in the per-project bind.
@@ -635,7 +635,7 @@ if ($null -ne $finalSettings) {
     if ($null -ne $delta -and $delta.Count -gt 0) {
         Write-CwcJsonFile $overlayPath $delta
     } elseif (Test-Path -LiteralPath $overlayPath) {
-        # No delta vs. global anymore — clean up a stale overlay.
+        # No delta vs. global anymore -- clean up a stale overlay.
         Remove-Item -LiteralPath $overlayPath -Force -ErrorAction SilentlyContinue
     }
 }

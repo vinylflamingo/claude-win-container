@@ -16,10 +16,10 @@
 # Run AS ADMINISTRATOR. Cleans up after itself unless -KeepRule is passed.
 #
 # Verdict legend at end:
-#   GO         — Hyper-V Firewall path viable; build C1 backend.
-#   FALLBACK   — only the legacy vNIC-ACL path works; build C2 backend.
-#   PARTIAL    — works in some isolation modes but not all; need to constrain harden.
-#   INVESTIGATE — neither path works cleanly; revisit design.
+#   GO         -- Hyper-V Firewall path viable; build C1 backend.
+#   FALLBACK   -- only the legacy vNIC-ACL path works; build C2 backend.
+#   PARTIAL    -- works in some isolation modes but not all; need to constrain harden.
+#   INVESTIGATE -- neither path works cleanly; revisit design.
 #
 # Usage:
 #   .\tests\spikes\hyperv-firewall.ps1                     # full run, default IPs
@@ -51,7 +51,7 @@ function Add-Result {
         'WARN' { 'Yellow' }
         default { 'Gray' }
     }
-    Write-Host ("  [{0,-4}] {1}{2}" -f $Status, $Step, $(if ($Detail) { " — $Detail" } else { '' })) -ForegroundColor $color
+    Write-Host ("  [{0,-4}] {1}{2}" -f $Status, $Step, $(if ($Detail) { " -- $Detail" } else { '' })) -ForegroundColor $color
 }
 
 function Section([string]$title) {
@@ -98,7 +98,7 @@ $hasVmAcl = [bool](Get-Command Add-VMNetworkAdapterExtendedAcl -ErrorAction Sile
 if ($hasVmAcl) {
     Add-Result 'Hyper-V VM ACL cmdlets' 'PASS' 'Add-VMNetworkAdapterExtendedAcl available'
 } else {
-    Add-Result 'Hyper-V VM ACL cmdlets' 'WARN' 'not available — Hyper-V management module missing'
+    Add-Result 'Hyper-V VM ACL cmdlets' 'WARN' 'not available -- Hyper-V management module missing'
 }
 
 # Docker reachable
@@ -109,7 +109,7 @@ try {
 } catch {
     Add-Result 'Docker daemon' 'FAIL' $_.Exception.Message
     Write-Host ''
-    Write-Host 'Aborting — Docker not reachable.' -ForegroundColor Red
+    Write-Host 'Aborting -- Docker not reachable.' -ForegroundColor Red
     exit 1
 }
 
@@ -138,13 +138,13 @@ if ($hasHyperVFirewall) {
         if ($dockerCreator) {
             Add-Result 'Docker creator match' 'PASS' "$($dockerCreator.Name)"
         } else {
-            Add-Result 'Docker creator match' 'FAIL' 'no creator matches /docker|container/ — see list above'
+            Add-Result 'Docker creator match' 'FAIL' 'no creator matches /docker|container/ -- see list above'
         }
     } catch {
         Add-Result 'VM creator enumeration' 'FAIL' $_.Exception.Message
     }
 } else {
-    Add-Result 'C1 path' 'WARN' 'skipped — Hyper-V Firewall unavailable'
+    Add-Result 'C1 path' 'WARN' 'skipped -- Hyper-V Firewall unavailable'
 }
 
 # Determine which isolation modes to test
@@ -217,7 +217,7 @@ if ($hasHyperVFirewall -and $dockerCreator) {
 Section 'C2: legacy vNIC extended ACL path'
 
 if (-not $hasVmAcl) {
-    Add-Result 'C2 path' 'WARN' 'skipped — VM ACL cmdlets unavailable'
+    Add-Result 'C2 path' 'WARN' 'skipped -- VM ACL cmdlets unavailable'
 } else {
     # Strategy: start a long-running container in hyperv isolation, find its UVM, apply
     # an extended ACL blocking $BlockIp, probe from inside, then remove and verify.
@@ -237,7 +237,7 @@ if (-not $hasVmAcl) {
     $vm = $null
     if ($cid) {
         # Hyper-V isolated containers create a VM whose name embeds part of the container ID.
-        # The exact format has changed across Docker versions — try a few patterns.
+        # The exact format has changed across Docker versions -- try a few patterns.
         Start-Sleep -Seconds 3
         try {
             $vms = Get-VM -ErrorAction Stop
@@ -312,15 +312,15 @@ $c2Works = $hasVmAcl -and (
 )
 
 $verdict = if ($c1AllModes) {
-    'GO — build C1 (Hyper-V Firewall) as primary backend.'
+    'GO -- build C1 (Hyper-V Firewall) as primary backend.'
 } elseif ($c1Works -and $c2Works) {
-    'PARTIAL — C1 works for some isolation modes; use C2 to fill gaps. Build both.'
+    'PARTIAL -- C1 works for some isolation modes; use C2 to fill gaps. Build both.'
 } elseif ($c1Works) {
-    'PARTIAL — C1 works for tested isolation modes only; document constraint in cwc harden.'
+    'PARTIAL -- C1 works for tested isolation modes only; document constraint in cwc harden.'
 } elseif ($c2Works) {
-    'FALLBACK — only legacy vNIC ACL works on this host. Build C2; document C1 as future work.'
+    'FALLBACK -- only legacy vNIC ACL works on this host. Build C2; document C1 as future work.'
 } else {
-    'INVESTIGATE — neither backend works cleanly. Review failures above before building harden.'
+    'INVESTIGATE -- neither backend works cleanly. Review failures above before building harden.'
 }
 
 Write-Host ''

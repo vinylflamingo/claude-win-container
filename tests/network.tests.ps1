@@ -59,7 +59,7 @@ Run-TestCase -Category network -Name 'host-gateway target /32 allow-route presen
     Set-CwcConfig -LockdownLan $true -ExtraHosts @{
         'test.cwc.local' = @{ target = 'host-gateway'; ports = @(443) }
     }
-    # Resolve host-gateway IP, check the /32 allow-route. (RFC1918 only — see security.md
+    # Resolve host-gateway IP, check the /32 allow-route. (RFC1918 only -- see security.md
     # for why this all-ports allow exists; portproxy narrows the FQDN path but the IP
     # itself is reachable on all ports through this route.)
     $out = Invoke-InContainer @'

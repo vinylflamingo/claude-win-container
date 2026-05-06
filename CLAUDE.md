@@ -31,7 +31,44 @@ These are conventions I've encoded into the code and that future changes need to
 
 If you change one, change the other. Search for `KEEP IN SYNC` comments.
 
-### 2. PowerShell 5.1 only — no PowerShell 7+ features.
+### 2. `entrypoint.ps1` must be ASCII-only.
+
+PowerShell 5.1 in the Server Core base image reads `.ps1` files using the system ANSI code page (Windows-1252), **not** UTF-8 — unless the file has a UTF-8 BOM. Multi-byte UTF-8 sequences (em-dashes `—`, arrows `→`, ellipses `…`, curly quotes) get reinterpreted as garbled bytes and break the parser at runtime with errors like:
+
+```
+Unexpected token 'would' in expression or statement.
+```
+
+(That's an em-dash inside a string literal — UTF-8 `0xE2 0x80 0x94` reread as `â€"`, where the stray `"` closes the string early.)
+
+The CI workflow has a `Verify entrypoint.ps1 is ASCII-only` step that fails the build on any byte > 127. Don't bypass it — replace the offending character:
+
+| Source | Replace with |
+| --- | --- |
+| `—` (em-dash) | `--` |
+| `–` (en-dash) | `-` |
+| `→` (right arrow) | `->` |
+| `←` (left arrow) | `<-` |
+| `…` (ellipsis) | `...` |
+| `'` `'` (curly singles) | `'` |
+| `"` `"` (curly doubles) | `"` |
+| `═` (box drawing) | `=` |
+| `✓` `×` etc. | `OK` / `x` / `*` |
+
+This rule applies hardest to `entrypoint.ps1` (runs in the container, PS 5.1, ANSI code page). The other `.ps1` files run on the host where PowerShell 7 handles UTF-8 correctly, but we ASCII-fy them too as defense-in-depth — the cost is purely typographic.
+
+When using the Edit/Write tool to modify any `.ps1` file, prefer ASCII alternatives by default. If you accidentally introduce a non-ASCII char and the CI lint catches it, run a one-shot replacement:
+
+```powershell
+$path = 'entrypoint.ps1'
+$content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+$content = $content -replace '[—]', '--' -replace '[→]', '->' -replace '[…]', '...'
+[System.IO.File]::WriteAllText($path, $content, [System.Text.Encoding]::ASCII)
+```
+
+(Throws if any non-ASCII chars remain — the ASCII encoder fails on `?` substitution by default in some configs but the read/write round-trip will surface them.)
+
+### 3. PowerShell 5.1 only — no PowerShell 7+ features.
 
 Server Core ltsc2019 ships PowerShell 5.1. The container runs on it. Avoid:
 
@@ -42,31 +79,31 @@ Server Core ltsc2019 ships PowerShell 5.1. The container runs on it. Avoid:
 
 If you write something that won't work in 5.1, the test that exercises it will fail in a confusing way. Stick to 5.1-compatible idioms.
 
-### 3. `CWC_*` env vars are NEVER read from project `.env`.
+### 4. `CWC_*` env vars are NEVER read from project `.env`.
 
 Sandbox-control flags (`CWC_LOCKDOWN_LAN`, `CWC_ALLOW_NETS`, `CWC_EXTRA_HOSTS`, `CWC_HARDEN`) come from the user's shell env (one-shot) or `~/.cwc/config.json` (persistent), and that's it. The agent has RW access to the workspace; if `.env` could drive these, the agent could write `CWC_LOCKDOWN_LAN=0` and disable the lockdown next launch. This is enforced in `cwc.ps1`'s forwarding loop — see the comment `# CWC_* keys can only come from shell env or user config`.
 
 If you ever extend the env-forwarding rules, do not regress this.
 
-### 4. The watchdog uses `Start-Job`, not `Start-Process`.
+### 5. The watchdog uses `Start-Job`, not `Start-Process`.
 
 `Start-Process -WindowStyle Hidden` is unreliable in Server Core containers — there's no GUI subsystem, and `Hidden` requires one. `Start-Process -NoNewWindow` is also fragile. `Start-Job` runs in a child PowerShell runspace via the job system, which is purpose-built for long-running background work and works in headless environments. The watchdog explicitly `Import-Module NetTCPIP, NetAdapter` because module auto-loading is unreliable in job runspaces.
 
 If the watchdog needs more stuff, prefer Start-Job and add explicit imports.
 
-### 5. `netsh portproxy` requires `iphlpsvc`. The entrypoint starts it; if start fails, fall back gracefully.
+### 6. `netsh portproxy` requires `iphlpsvc`. The entrypoint starts it; if start fails, fall back gracefully.
 
 Server Core ships `iphlpsvc` disabled. The entrypoint sets it to `Manual` startup and starts it before issuing any `netsh portproxy add`. If the start fails (service genuinely missing or refusing to start), the code falls back to the legacy direct-mapping behaviour (hosts file points at the gateway IP, `/32` allow-route, all ports reachable). Functionality is preserved; per-port narrowing is lost. The fallback prints a banner.
 
 Don't remove the fallback. Don't assume `portproxy` always works.
 
-### 6. Test environment-variable cleanup.
+### 7. Test environment-variable cleanup.
 
 The test harness clears a list of "cwc-managed" env vars between tests (`$script:cwcManagedEnvVars` in `tests/lib/harness.ps1`). This list MUST contain every env var that `cwc.ps1` sets via the `if (-not $env:CWC_FOO) { $env:CWC_FOO = ... }` pattern. If you add a new env var with that pattern, add it to the cleanup list, or test pollution between tests will produce baffling failures (a test sets `HardenEnabled $true` but the container sees `CWC_HARDEN=0` because an earlier test left it set).
 
 I learned this the hard way; it cost two test re-runs to find.
 
-### 7. Embedding JSON in `Invoke-InContainer` test commands is unreliable.
+### 8. Embedding JSON in `Invoke-InContainer` test commands is unreliable.
 
 The test runner pipes commands through PowerShell → docker → PowerShell argv. Each layer can mangle quotes. **Single-quoted JSON literals embedded in a `-Command` string are particularly fragile** — quotes get eaten by some intermediate parser.
 
@@ -76,7 +113,7 @@ Two reliable patterns:
 
 If a test starts mysteriously failing with empty / mangled JSON, it's almost always quoting.
 
-### 8. Host-side tests use `Invoke-CwcOnHost`, not `Invoke-InContainer`.
+### 9. Host-side tests use `Invoke-CwcOnHost`, not `Invoke-InContainer`.
 
 Tests that exercise `cwc.ps1` behaviour (denylist, trust, harden config) use `Invoke-CwcOnHost`. It captures `*>&1` (all PowerShell streams), because `cwc.ps1` writes user-facing output via `Write-Host` which goes to the information stream — `2>&1` alone misses it.
 
@@ -84,7 +121,7 @@ Don't switch host-side tests to `Invoke-InContainer` thinking it's a more "compl
 - `Invoke-CwcOnHost` — exercises `cwc.ps1` (host-side, fast, no container start).
 - `Invoke-InContainer` — exercises the entrypoint and container behaviour (slow, requires Docker, includes a container start).
 
-### 9. Tests must be run with `-Build` after `entrypoint.ps1` or `Dockerfile` changes.
+### 10. Tests must be run with `-Build` after `entrypoint.ps1` or `Dockerfile` changes.
 
 The default test target is `fcostoya/claude-win-container:latest` — the published image, which doesn't have your local changes. `tests/run.ps1 -Build` rebuilds from the local `Dockerfile` (writing to `:dev` by default) before running the suite.
 
@@ -126,6 +163,7 @@ A reference for diagnosing test breakage:
 | Harden test: routes not re-applied | `CWC_HARDEN=0` in test output despite `-HardenEnabled $true` → env var not in `$cwcManagedEnvVars` cleanup list |
 | Settings test: overlay not written | JSON quoting mangled through the `-Command` pipeline → use file staging |
 | `[cwc] hosts skipped: ... (portproxy add failed for all ports)` | `iphlpsvc` not running and the fallback should have triggered — check that path |
+| Smoke test fails with `Unexpected token 'would' in expression or statement` (or similar gibberish followed by tokens from a string body) | UTF-8 multi-byte char (em-dash, arrow, ellipsis) in `entrypoint.ps1` parsed as Windows-1252 by PS 5.1 in the container — see Hard rule #2. CI lint catches this on push, but local edits with the Edit tool can sneak chars in. ASCII-fy the file. |
 
 ## Cross-doc consistency
 

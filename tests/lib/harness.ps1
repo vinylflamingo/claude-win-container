@@ -39,7 +39,7 @@ function Run-TestCase {
 
 # Env vars the launcher manages internally (sets in $env: to communicate with docker
 # compose's variable substitution). PowerShell scripts run in the same process as the
-# caller, so the launcher's env mutations persist into our test runner — between tests
+# caller, so the launcher's env mutations persist into our test runner -- between tests
 # they would leak the previous test's values (since the launcher's
 # `if (-not $env:CWC_LOCKDOWN_LAN)` guard prevents re-setting from config). We clear
 # these before every Invoke-InContainer call so each test starts from a clean env and
@@ -80,7 +80,7 @@ function Invoke-InContainer {
         $raw = & cwc powershell -NoProfile -Command $Command 2>&1
     } finally {
         Pop-Location
-        # Final cleanup — including any -Env vars the test set
+        # Final cleanup -- including any -Env vars the test set
         foreach ($v in $script:cwcManagedEnvVars) {
             Remove-Item "Env:$v" -ErrorAction SilentlyContinue
         }

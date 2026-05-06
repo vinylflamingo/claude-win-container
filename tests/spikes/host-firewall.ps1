@@ -4,8 +4,8 @@
 # either Hyper-V Firewall (no VM creator) or Hyper-V VM Manager (Get-VM blind to
 # HCS-managed containers). So both backends from the original plan are inapplicable.
 #
-# This spike tests whether plain Windows Defender Firewall outbound rules — scoped
-# to the container's source IP/subnet or to the NAT bridge interface — can do the
+# This spike tests whether plain Windows Defender Firewall outbound rules -- scoped
+# to the container's source IP/subnet or to the NAT bridge interface -- can do the
 # job. If they can, harden's implementation is dramatically simpler than HNS/VFP
 # scripting.
 #
@@ -19,7 +19,7 @@
 # For each approach we measure:
 #   - Does the rule block container egress to $BlockIp?
 #   - Does it leave $AllowIp reachable from the container?
-#   - Does it leave host egress to $BlockIp untouched? (regression check — we
+#   - Does it leave host egress to $BlockIp untouched? (regression check -- we
 #     don't want to accidentally block our own host)
 #
 # Run AS ADMINISTRATOR. Cleans up after itself unless -KeepRules is passed.
@@ -46,7 +46,7 @@ function Add-Result {
         'WARN' { 'Yellow' }
         default { 'Gray' }
     }
-    Write-Host ("  [{0,-4}] {1}{2}" -f $Status, $Step, $(if ($Detail) { " — $Detail" } else { '' })) -ForegroundColor $color
+    Write-Host ("  [{0,-4}] {1}{2}" -f $Status, $Step, $(if ($Detail) { " -- $Detail" } else { '' })) -ForegroundColor $color
 }
 
 function Section([string]$title) {
@@ -127,7 +127,7 @@ try {
     exit 1
 }
 
-Section 'Discovery — Docker network topology'
+Section 'Discovery -- Docker network topology'
 
 # Get Docker's nat network details
 $subnet  = $null
@@ -157,7 +157,7 @@ if ($gateway) {
         $natIfAlias = $natAdapter.InterfaceAlias
         Add-Result 'NAT bridge adapter' 'PASS' "alias='$natIfAlias' idx=$($natAdapter.InterfaceIndex)"
     } catch {
-        Add-Result 'NAT bridge adapter' 'WARN' "could not resolve adapter for gateway $gateway — $($_.Exception.Message)"
+        Add-Result 'NAT bridge adapter' 'WARN' "could not resolve adapter for gateway $gateway -- $($_.Exception.Message)"
     }
 }
 
@@ -175,7 +175,7 @@ try {
     Add-Result 'NetNat enumeration' 'WARN' $_.Exception.Message
 }
 
-# Network compartments — Windows isolates container networking here
+# Network compartments -- Windows isolates container networking here
 try {
     $compartments = Get-NetCompartment -ErrorAction Stop
     foreach ($c in $compartments) {
@@ -187,7 +187,7 @@ try {
 
 if (-not $subnet) {
     Write-Host ''
-    Write-Host 'Aborting — no Docker NAT subnet detected; nothing to scope rules to.' -ForegroundColor Red
+    Write-Host 'Aborting -- no Docker NAT subnet detected; nothing to scope rules to.' -ForegroundColor Red
     exit 1
 }
 
@@ -210,7 +210,7 @@ if ($baseBlock -ne 'REACHABLE') {
     Write-Host "Warning: container can't reach $BlockIp at baseline; rule tests will be inconclusive." -ForegroundColor Yellow
 }
 
-Section 'Approach A — LocalAddress (source-IP) scope'
+Section 'Approach A -- LocalAddress (source-IP) scope'
 
 $ruleA = 'cwc-spike-fw-A'
 Remove-SpikeRule $ruleA
@@ -229,7 +229,7 @@ $resultA = Test-Approach -Label 'A' -AddRule {
 
 Remove-SpikeRule $ruleA
 
-Section 'Approach B — InterfaceAlias scope'
+Section 'Approach B -- InterfaceAlias scope'
 
 $resultB = $null
 if ($natIfAlias) {
@@ -250,10 +250,10 @@ if ($natIfAlias) {
 
     Remove-SpikeRule $ruleB
 } else {
-    Add-Result 'B' 'WARN' 'skipped — NAT bridge adapter not resolved'
+    Add-Result 'B' 'WARN' 'skipped -- NAT bridge adapter not resolved'
 }
 
-Section 'Approach C — combined'
+Section 'Approach C -- combined'
 
 $resultC = $null
 if ($natIfAlias) {
@@ -275,7 +275,7 @@ if ($natIfAlias) {
 
     Remove-SpikeRule $ruleC
 } else {
-    Add-Result 'C' 'WARN' 'skipped — NAT bridge adapter not resolved'
+    Add-Result 'C' 'WARN' 'skipped -- NAT bridge adapter not resolved'
 }
 
 Section 'Verdict'
@@ -295,9 +295,9 @@ Write-Host ("  FAIL: {0}" -f $fail) -ForegroundColor $(if ($fail) { 'Red' } else
 
 Write-Host ''
 if ($winning.Count -gt 0) {
-    Write-Host "  Verdict: GO — approach(es) $($winning -join ', ') work cleanly. Build harden using the simplest." -ForegroundColor Green
+    Write-Host "  Verdict: GO -- approach(es) $($winning -join ', ') work cleanly. Build harden using the simplest." -ForegroundColor Green
 } else {
-    Write-Host '  Verdict: INVESTIGATE — no Defender Firewall approach blocks container egress while leaving' -ForegroundColor Yellow
+    Write-Host '  Verdict: INVESTIGATE -- no Defender Firewall approach blocks container egress while leaving' -ForegroundColor Yellow
     Write-Host '  host egress and other-IP container egress intact. Next layer to try: HNS / VFP policies.' -ForegroundColor Yellow
 }
 

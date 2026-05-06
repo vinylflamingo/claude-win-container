@@ -1,4 +1,4 @@
-# tests/run.ps1 — Layer 1 isolation tests.
+# tests/run.ps1 -- Layer 1 isolation tests.
 #
 # What it does:
 #   1. Snapshots your real ~/.cwc/config.json so tests can mutate it freely
@@ -28,7 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# Resolve cwc — the launcher next to this repo, not whatever's installed for the user.
+# Resolve cwc -- the launcher next to this repo, not whatever's installed for the user.
 $repoRoot = Split-Path -Parent $here
 $cwcLauncher = Join-Path $repoRoot 'cwc.ps1'
 if (-not (Test-Path $cwcLauncher)) {
@@ -42,7 +42,7 @@ $savedImage = $env:CWC_IMAGE
 if ($Image) { $env:CWC_IMAGE = $Image }
 
 # Optional: rebuild the image before running. Strongly recommended when iterating
-# on entrypoint.ps1 or Dockerfile changes — the default image is the published one
+# on entrypoint.ps1 or Dockerfile changes -- the default image is the published one
 # from Docker Hub, which won't have your local changes. Without -Build, container-
 # tier tests (network, settings, harden) test the *published* image's behaviour,
 # not your working tree.

@@ -3,16 +3,16 @@
 # claude-sandbox.overlay.yml, .env, .mcp.json. When any of these change without
 # explicit `cwc trust` ack, cwc refuses to launch (or prompts in a real TTY).
 #
-# These tests run on the HOST — they exercise cwc.ps1's pre-launch behaviour
+# These tests run on the HOST -- they exercise cwc.ps1's pre-launch behaviour
 # without needing the container to actually start.
 
-# Helper: ensure a fresh per-test state — empty workspace files, no trust state.
+# Helper: ensure a fresh per-test state -- empty workspace files, no trust state.
 function Reset-TrustFixture {
     foreach ($f in @('.env', '.mcp.json', 'claude-sandbox.overlay.yml')) {
         $p = Join-Path $script:fixtures.workspace $f
         if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
     }
-    Set-CwcConfig  # default config — empty trusted_files map
+    Set-CwcConfig  # default config -- empty trusted_files map
 }
 
 Run-TestCase -Category trust -Name 'no tracked files - launches without prompt' -Test {

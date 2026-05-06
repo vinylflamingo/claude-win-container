@@ -63,7 +63,7 @@ Run-TestCase -Category settings -Name 'session changes go to per-project overlay
 
     # Stage the "agent edit" as a file in the workspace bind mount, then have the
     # container Copy-Item it onto the merged settings.json. This bypasses all the
-    # command-line quoting hazards of embedding JSON in a -Command string —
+    # command-line quoting hazards of embedding JSON in a -Command string --
     # literal double quotes inside the JSON would otherwise get eaten by some
     # layer of the PS -> docker -> PS argv pipeline.
     $stagePath = Join-Path $script:fixtures.workspace 'agent-edit-settings.json'

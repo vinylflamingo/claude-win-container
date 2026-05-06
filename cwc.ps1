@@ -1,4 +1,4 @@
-# cwc.ps1 — claude-win-container launcher.
+# cwc.ps1 -- claude-win-container launcher.
 # Launches a sandboxed Claude Code session against the current directory.
 #
 # Usage (from any project directory):
@@ -49,7 +49,7 @@ $projectDir = (Get-Location).Path
 # 0. Help
 function Show-CwcUsage {
     Write-Host ""
-    Write-Host "cwc — claude-win-container launcher" -ForegroundColor Cyan
+    Write-Host "cwc -- claude-win-container launcher" -ForegroundColor Cyan
     Write-Host "Sandboxed Claude Code in a Windows container, scoped to the current directory."
     Write-Host ""
     Write-Host "USAGE" -ForegroundColor Yellow
@@ -81,7 +81,7 @@ function Show-CwcUsage {
     Write-Host "                           any of these change between sessions."
     Write-Host "  trust list               Show trust state for tracked files in this project."
     Write-Host "  untrust                  Remove trust for this project (next 'cwc' will re-prompt)."
-    Write-Host "  auth reset               Wipe shared auth (~/.claude-win-container/auth/) — re-auth"
+    Write-Host "  auth reset               Wipe shared auth (~/.claude-win-container/auth/) -- re-auth"
     Write-Host "                           on next run. Per-project state is unaffected."
     Write-Host "  auth where               Print where shared and per-project state live."
     Write-Host "  harden {enable|disable|status}"
@@ -125,9 +125,9 @@ $cwcConfigDir  = Join-Path $env:USERPROFILE '.cwc'
 $cwcConfigPath = Join-Path $cwcConfigDir 'config.json'
 
 # Hostname / target validators. Used by both `cwc firewall host-add` (block bad input
-# at config-write time) and the entrypoint (defense in depth — refuse bad entries
+# at config-write time) and the entrypoint (defense in depth -- refuse bad entries
 # at hosts-file-write time even if config was hand-edited). Keep entrypoint.ps1
-# in sync with these — they're duplicated there because entrypoint runs in a
+# in sync with these -- they're duplicated there because entrypoint runs in a
 # different process inside the container.
 $script:cwcFqdnRegex = '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
 
@@ -150,7 +150,7 @@ function Test-CwcHostTarget([string]$target) {
 }
 
 # Default denylist for `cwc firewall host-add`. These cover Anthropic's auth-bearing
-# channels — redirecting them via hosts-file injection would let an agent (or careless
+# channels -- redirecting them via hosts-file injection would let an agent (or careless
 # `.env`) MITM the API key / OAuth token. Configurable via `cwc firewall denylist`.
 function Get-CwcDefaultDenylist {
     return @(
@@ -193,7 +193,7 @@ function Get-ProjectSlug([string]$path) {
 }
 
 # Trust system. The agent has RW on the workspace, so it can edit any file there
-# — including files we read at launcher start (compose overlay, .env forwarding,
+# -- including files we read at launcher start (compose overlay, .env forwarding,
 # .mcp.json env-key references). Each of these files can expand what flows into
 # the next session's container. The trust system tracks per-project SHA-256 of
 # these files and refuses to launch when they change without explicit ack.
@@ -293,7 +293,7 @@ function Show-TrustState($state) {
     }
 }
 
-# True iff stdin is hooked to a real console — used to decide whether to prompt
+# True iff stdin is hooked to a real console -- used to decide whether to prompt
 # or fail-closed on a trust mismatch. Mirrors install.ps1's approach.
 function Test-CwcInteractive {
     if (-not [Environment]::UserInteractive) { return $false }
@@ -318,7 +318,7 @@ function Read-CwcConfig {
     $json = $raw | ConvertFrom-Json
     # JSON objects deserialise to PSCustomObject; convert nested ones to hashtables for mutation.
     # extra_hosts schema: each value is { target = '<host-gateway|ip>', ports = @(<int>...) }.
-    # Old schema (pre-Phase 4) used a bare string target — we migrate inline (default ports 443,80)
+    # Old schema (pre-Phase 4) used a bare string target -- we migrate inline (default ports 443,80)
     # and emit a one-time banner when we first detect the migration.
     $hosts = @{}
     $script:cwcMigratedHostPorts = $false
@@ -326,7 +326,7 @@ function Read-CwcConfig {
         foreach ($p in $json.extra_hosts.PSObject.Properties) {
             $val = $p.Value
             if ($val -is [string]) {
-                # Old format: bare string target, no ports — grandfather to 443,80.
+                # Old format: bare string target, no ports -- grandfather to 443,80.
                 $hosts[$p.Name] = @{ target = [string]$val; ports = @(443, 80) }
                 $script:cwcMigratedHostPorts = $true
             } elseif ($val) {
@@ -352,7 +352,7 @@ function Read-CwcConfig {
     $denylist = if ($null -ne $json.host_denylist) {
         @($json.host_denylist) | Where-Object { $_ }
     } else {
-        # Existing config without host_denylist field — populate with defaults.
+        # Existing config without host_denylist field -- populate with defaults.
         @(Get-CwcDefaultDenylist)
     }
     # Per-project file-trust hashes. JSON deserialises nested objects as PSCustomObject;
@@ -558,7 +558,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
                             Write-Host "    $p  $tag"
                         }
                     } else {
-                        Write-Host "  (denylist empty — no FQDNs are refused)" -ForegroundColor Yellow
+                        Write-Host "  (denylist empty -- no FQDNs are refused)" -ForegroundColor Yellow
                     }
                     Write-Host ""
                 }
@@ -581,7 +581,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
                         Write-Host ""
                         Write-Host "  WARNING: '$pattern' is a default denylist entry." -ForegroundColor Yellow
                         Write-Host "  Removing it could allow agents to redirect Anthropic auth traffic via" -ForegroundColor Yellow
-                        Write-Host "  hosts-file injection — exfiltrating your API key on the next session." -ForegroundColor Yellow
+                        Write-Host "  hosts-file injection -- exfiltrating your API key on the next session." -ForegroundColor Yellow
                         Write-Host ""
                         $resp = Read-Host "  Remove anyway? [y/N]"
                         if ($resp -notmatch '^(y|yes)$') {
@@ -700,7 +700,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'mount') {
     exit 0
 }
 
-# `cwc trust` / `cwc untrust` — manage per-project file-trust hashes.
+# `cwc trust` / `cwc untrust` -- manage per-project file-trust hashes.
 # Trust covers files that drive next-session policy: claude-sandbox.overlay.yml,
 # .env, .mcp.json. The agent has RW on the workspace, so any of these can be edited
 # from inside the container; trust forces the dev to ack changes before they take effect.
@@ -713,7 +713,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
         if (-not $isProjectRoot) {
             Write-Host ""
             Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
-            Write-Host "  cwc trust operates per-project — cd to a project directory first."
+            Write-Host "  cwc trust operates per-project -- cd to a project directory first."
             Write-Host ""
             exit 1
         }
@@ -745,7 +745,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
         exit 0
     }
     if (-not $state.any_present) {
-        Write-Host "  No tracked files in this project — nothing to trust." -ForegroundColor DarkGray
+        Write-Host "  No tracked files in this project -- nothing to trust." -ForegroundColor DarkGray
         Write-Host "  Tracked: $($script:cwcTrustedFileNames -join ', ')"
         exit 0
     }
@@ -758,7 +758,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
     exit 0
 }
 
-# `cwc harden ...` — opt-in tamper-resistant in-container hardening.
+# `cwc harden ...` -- opt-in tamper-resistant in-container hardening.
 # When enabled, the container runs a watchdog that re-applies blackhole routes,
 # restores the hosts file from snapshot if changed, removes unauthorized /32 allow-routes
 # to RFC1918 destinations, and logs new entries in the trust store. The agent in the
@@ -815,7 +815,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'harden') {
                 Write-Host "    - The agent has admin in the container; with effort it can still"
                 Write-Host "      defeat the watchdog. This is a 'speed-bump made bigger,' not isolation."
                 Write-Host "    - Host-side enforcement (real isolation) is documented as future work in"
-                Write-Host "      docs/security.md — not implemented in v1 because Docker Desktop's"
+                Write-Host "      docs/security.md -- not implemented in v1 because Docker Desktop's"
                 Write-Host "      Windows containers don't expose a clean host-side firewall hook."
             } else {
                 Write-Host "  Run 'cwc harden enable' to turn on the in-container watchdog."
@@ -830,15 +830,15 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'harden') {
     exit 0
 }
 
-# `cwc auth ...` — manage shared auth state at ~/.claude-win-container/auth/.
-# Currently supports: reset (wipe shared auth — re-auth on next run), where (print path).
+# `cwc auth ...` -- manage shared auth state at ~/.claude-win-container/auth/.
+# Currently supports: reset (wipe shared auth -- re-auth on next run), where (print path).
 if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'auth') {
     $authSub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { 'help' }
     $authDirForCmd = Join-Path $env:USERPROFILE '.claude-win-container\auth'
     switch ($authSub) {
         'reset' {
             if (-not (Test-Path $authDirForCmd)) {
-                Write-Host "  Auth dir not present at $authDirForCmd — nothing to reset." -ForegroundColor DarkGray
+                Write-Host "  Auth dir not present at $authDirForCmd -- nothing to reset." -ForegroundColor DarkGray
                 exit 0
             }
             Write-Host ""
@@ -908,7 +908,7 @@ foreach ($dir in @($authDir, $cfgDir, $histDir)) {
     }
 }
 
-# 2b. Trust check — workspace files that drive next-session policy
+# 2b. Trust check -- workspace files that drive next-session policy
 # (claude-sandbox.overlay.yml, .env, .mcp.json). The agent has RW in the workspace,
 # so any of these can be agent-edited; we refuse to silently inherit those edits.
 $cwcCfg = Read-CwcConfig
@@ -919,9 +919,9 @@ if ($trustState.any_changed) {
     Show-TrustState $trustState
     Write-Host ""
     Write-Host "  These files drive what flows into the container:" -ForegroundColor DarkGray
-    Write-Host "    claude-sandbox.overlay.yml  — auto-loaded compose overlay (mounts, networks, etc.)"
-    Write-Host "    .env                        — env vars forwarded into the container"
-    Write-Host "    .mcp.json                   — MCP servers + extra env-key references that get forwarded"
+    Write-Host "    claude-sandbox.overlay.yml  -- auto-loaded compose overlay (mounts, networks, etc.)"
+    Write-Host "    .env                        -- env vars forwarded into the container"
+    Write-Host "    .mcp.json                   -- MCP servers + extra env-key references that get forwarded"
     Write-Host ""
     if (-not (Test-CwcInteractive)) {
         Write-Host "  Refusing to launch (non-interactive session)." -ForegroundColor Red
@@ -965,7 +965,7 @@ $env:CLAUDE_STATE_AUTH    = $authDir
 
 # 4a. Apply user config (~/.cwc/config.json) to the firewall env vars.
 # Config was already read above for the trust check; reuse it. The user config is
-# the only source for CWC_* values now — project .env can no longer drive them
+# the only source for CWC_* values now -- project .env can no longer drive them
 # (Phase 2 of the security plan; see docs/security.md).
 if (-not $env:CWC_LOCKDOWN_LAN) {
     $env:CWC_LOCKDOWN_LAN = if ($cwcCfg.lockdown_lan) { '1' } else { '0' }
@@ -983,7 +983,7 @@ if (@($cwcCfg.allow_nets).Count -gt 0) {
 # Format: "fqdn|target|port1,port2;fqdn2|target2|port3"
 # Uses pipe + semicolon (not colon + comma) to keep ports unambiguous and avoid
 # colliding with IPv6 colons in target. Old colon-only format from pre-Phase 4 is
-# still accepted by the entrypoint as a fallback (no ports → defaults to 443,80).
+# still accepted by the entrypoint as a fallback (no ports -> defaults to 443,80).
 $hostSummary = @()
 if (@($cwcCfg.extra_hosts.Keys).Count -gt 0) {
     $pairs = foreach ($fqdn in $cwcCfg.extra_hosts.Keys) {
@@ -996,7 +996,7 @@ if (@($cwcCfg.extra_hosts.Keys).Count -gt 0) {
     $env:CWC_EXTRA_HOSTS = $pairs -join ';'
 }
 
-# One-time migration banner — printed on the first session after upgrading from the
+# One-time migration banner -- printed on the first session after upgrading from the
 # pre-Phase-4 schema (bare-string targets, no per-port restriction). Re-saving the
 # config in new format dismisses the banner permanently.
 if ($script:cwcMigratedHostPorts) {
@@ -1009,7 +1009,7 @@ if ($script:cwcMigratedHostPorts) {
 }
 
 # Build --volume flags for additional bind mounts (Obsidian vault, design specs, etc.).
-# Skips mounts whose source has gone missing — warns but doesn't fail the session.
+# Skips mounts whose source has gone missing -- warns but doesn't fail the session.
 $mountFlags = @()
 $mountSummary = @()
 if (@($cwcCfg.mounts.Keys).Count -gt 0) {
@@ -1027,12 +1027,12 @@ if (@($cwcCfg.mounts.Keys).Count -gt 0) {
 
 # 4b. Forward env vars from project's .env
 # Allowlist:
-#   - ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN  (auth — used by Claude itself)
+#   - ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN  (auth -- used by Claude itself)
 #   - any key prefixed CLAUDE_*                   (consumer-defined Claude config)
 #   - any key referenced as ${KEY} in .mcp.json   (MCP server runtime config)
-# We do NOT forward arbitrary keys — the project's .env may contain DB passwords, etc.
+# We do NOT forward arbitrary keys -- the project's .env may contain DB passwords, etc.
 #
-# CWC_* keys are NEVER read from project .env — they're sandbox-control flags and the
+# CWC_* keys are NEVER read from project .env -- they're sandbox-control flags and the
 # agent has RW on the workspace, so allowing project .env to set them would let the
 # agent silently disable the lockdown / inject into the hosts file on the next launch.
 # Shell env CWC_* still works (one-shot dev override); user config (~/.cwc/config.json)
@@ -1084,7 +1084,7 @@ if (-not $env:CWC_HARDEN) {
     $env:CWC_HARDEN = if ($cwcCfg.harden_enabled) { '1' } else { '0' }
 }
 foreach ($k in $dotenv.Keys) {
-    # CWC_* deliberately excluded here — see comment block above.
+    # CWC_* deliberately excluded here -- see comment block above.
     if ($k -like 'CLAUDE_*' -or $k -like 'ANTHROPIC_*') {
         [void]$forwardKeys.Add($k)
     }
@@ -1092,7 +1092,7 @@ foreach ($k in $dotenv.Keys) {
 foreach ($k in $mcpKeys) { [void]$forwardKeys.Add($k) }
 
 # Build the -e flag list.
-# For CWC_* keys: read ONLY from process env (one-shot shell override) — never from
+# For CWC_* keys: read ONLY from process env (one-shot shell override) -- never from
 # project .env, even though they're in $forwardKeys (the explicit Adds above seed
 # them so user-config-derived $env:CWC_* values still get forwarded into the container).
 # For everything else: project .env first, then process env.
@@ -1132,14 +1132,14 @@ if ($Build) {
     if ($LASTEXITCODE -ne 0) { throw "docker compose build failed" }
 } elseif ($Pull -or $imageMissing) {
     if ($imageMissing) {
-        Write-Host "Image $cwcImage not found locally — pulling from Docker Hub..." -ForegroundColor Cyan
+        Write-Host "Image $cwcImage not found locally -- pulling from Docker Hub..." -ForegroundColor Cyan
     } else {
         Write-Host "Pulling $cwcImage..." -ForegroundColor Cyan
     }
     & docker pull $cwcImage
     if ($LASTEXITCODE -ne 0) {
         if ($haveLocalDockerfile) {
-            Write-Host "Pull failed — falling back to local build." -ForegroundColor Yellow
+            Write-Host "Pull failed -- falling back to local build." -ForegroundColor Yellow
             & docker compose @composeArgs build claude-code
             if ($LASTEXITCODE -ne 0) { throw "docker compose build (fallback) failed" }
         } else {
