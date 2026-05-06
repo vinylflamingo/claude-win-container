@@ -1,0 +1,140 @@
+# Security model
+
+This document describes what `cwc` defends against, what it deliberately doesn't, and the limitations you should know about before relying on it.
+
+It's deliberately direct about what's a "speed-bump" vs. real isolation. If you're using `cwc` for personal dev work, the speed-bumps are usually enough; if you're handing the agent rights you wouldn't hand to an unknown human, read each layer's "Limitations" subsection and the [Future work](#future-work-host-side-enforcement) section before deciding.
+
+## Threat model
+
+The threat we're defending against is **the agent reaching resources the developer didn't authorize**.
+
+Not in scope:
+- The developer intentionally giving the agent broad access (mounting `C:\` rw, disabling the firewall, allowing any FQDN). That's the developer's call. cwc starts at restrictive defaults; relaxing them is your decision.
+- The agent doing harm to things the developer *did* authorize. If you give the agent write access to your project, it can rewrite your project. That's by design.
+- Sophisticated supply-chain attacks (compromised npm packages, GitHub repos). Public egress is allowed; package code from npm runs in the container. Nothing in cwc filters which packages claude or its MCP servers fetch.
+
+In scope:
+- An agent acting on a wrong instruction or a prompt injection silently expanding what it can reach (LAN, host filesystem, persistent state of other projects).
+- Workspace files driving silent policy changes — e.g., the agent writing `.env` to disable the lockdown, or planting `claude-sandbox.overlay.yml` to mount the host C drive.
+- Cross-project contamination — an agent in project A persisting code/config that runs in project B's session.
+- Credential exfiltration via DNS spoofing of `api.anthropic.com`.
+
+## Defense layers
+
+cwc has five layers. They stack.
+
+### 1. Filesystem isolation (Docker bind mounts)
+
+The container sees:
+- `C:\workspace` — your project, RW.
+- `C:\claude-data` — per-project state (memory, sessions, plugins, settings overlay).
+- `C:\command-history` — per-project shell history.
+- `C:\claude-auth` — shared auth state (OAuth tokens, MCP-auth cache, global settings).
+- `C:\docs\<name>` — any folders you added with `cwc mount add`.
+
+Your home folder, the rest of the host filesystem, the Docker socket, and host devices are not visible inside the container. Hyper-V isolation (default on Windows 10/11 Pro+) gives kernel separation: even a compromised container can't reach the host kernel.
+
+**Limitations.** A project shipping `claude-sandbox.overlay.yml` can extend the mount set. Layer 4 (the trust system) catches that — you have to explicitly trust the overlay before it's loaded.
+
+### 2. LAN-egress lockdown (in-container, default on)
+
+The entrypoint installs blackhole routes for RFC1918, IPv6 link-local, and IPv6 ULA destinations. Outbound TCP to `192.168.x.x` / `10.x.x.x` / `172.16.x.x` / `169.254.x.x` / `fe80::/10` / `fc00::/7` is dropped. Public IPs (Anthropic, npm, GitHub, etc.) route normally.
+
+You can re-allow specific subnets with `cwc firewall allow <cidr>`, and map FQDNs to host services with `cwc firewall host-add`. See [`firewall.md`](./firewall.md) for the mechanics and per-port narrowing.
+
+**Limitations.** This is enforced *inside* the container. The agent has admin rights inside the container and can run `Remove-NetRoute` to disable the blackhole. Layer 5 (harden) raises that bar; full closure requires host-side enforcement which is documented as future work below.
+
+### 3. Per-port host-service narrowing (`cwc firewall host-add`)
+
+When you run `cwc firewall host-add traefik.local host-gateway 443`, the entrypoint:
+- Allocates a per-FQDN loopback IP (`127.0.0.X`).
+- Sets up `netsh interface portproxy` to forward `127.0.0.X:443 → <host-gateway>:443`.
+- Writes `127.0.0.X traefik.local` into the container's hosts file.
+
+Result: the agent reaching `traefik.local:443` works; `traefik.local:8080` doesn't (no portproxy listener on that port for the loopback IP).
+
+**Limitations.** A `/32` allow-route through the lockdown is necessary for portproxy itself to reach the gateway IP. That allow-route is necessarily all-ports (Windows routing has no per-port granularity). So if the agent discovers the gateway IP (e.g. via `Resolve-DnsName host.docker.internal`) and connects to it directly on a different port, it succeeds. The narrowing covers the FQDN path; direct-IP-to-gateway is a known gap, addressable only by host-side enforcement.
+
+### 4. Workspace file trust (`cwc trust`)
+
+Three files in your project drive what flows into the next session:
+- `claude-sandbox.overlay.yml` — auto-loaded compose overlay (mounts, networks, etc.).
+- `.env` — environment variables forwarded into the container.
+- `.mcp.json` — MCP server registrations + extra `${KEY}` references that get forwarded from your shell env.
+
+The agent has RW on the workspace, so it can edit any of these. cwc tracks a per-project SHA-256 of each tracked file in `~/.cwc/config.json`. Before launch, if any file's hash doesn't match (or it's an untrusted file that newly appeared), cwc refuses to start until you run `cwc trust`.
+
+In an interactive session, you get a prompt with a per-file diff summary. In a non-interactive session (CI, etc.), cwc fails fast with a "run `cwc trust`" message — no silent inheritance.
+
+**`CWC_*` env vars are *never* read from project `.env`.** They're sandbox control flags; the agent could trivially bypass the lockdown by writing `CWC_LOCKDOWN_LAN=0` to `.env` if we honored that. Persistent CWC_* settings live in `~/.cwc/config.json`; one-shot overrides go through your shell env.
+
+**Limitations.** If you `cwc trust` without reading the diff, you lose this protection. The prompt is a guard rail, not a wall.
+
+### 5. Tamper-resistant harden (`cwc harden enable`, opt-in)
+
+The default lockdown is in-container, so admin in the container can disable it. Harden adds an in-container watchdog process that runs every 2 seconds and:
+- Re-applies blackhole routes if any are removed.
+- Removes unauthorized `/32` allow-routes to RFC1918 destinations (anything beyond what cwc set up itself).
+- Restores the hosts file from snapshot if its contents change.
+- Logs new entries in the trust store (does not auto-revert — could break legitimate corporate-CA setups).
+
+**Limitations.** Harden is also in-container. The agent can:
+- `Stop-Process` the watchdog.
+- `Remove-Item` the watchdog script.
+- Race the loop: change a route, make an outbound TCP connection (which persists once established), and accept the route being reverted 2s later.
+
+Each of these is a deliberate, multi-step act. The realistic threat (claude tool-using its way to a `Remove-NetRoute` because something seemed in the way) is closed; a determined attacker is not.
+
+For real isolation, the answer is host-side enforcement — see [Future work](#future-work-host-side-enforcement).
+
+## Cross-project state
+
+`~/.cwc/config.json` (firewall config, trust hashes, harden state) is global to your machine.
+
+`~/.claude-win-container/auth/` is shared across all projects' sessions. It holds:
+- `.credentials.json` — OAuth tokens. Needed across projects so you don't re-auth on each `cd`.
+- `mcp-needs-auth-cache.json` — small cache, regenerable.
+- `settings.json` — global preferences (theme, telemetry, autoUpdater).
+
+`~/.claude-win-container/projects/<slug>/` is per-project. Holds:
+- `config/` — Claude's per-project state (sessions, todos, plans, history.jsonl, plugins, caches, statsig, telemetry).
+- `config/settings-project.json` — per-project settings overlay (computed delta vs. global on each session exit).
+- `history/` — shell history.
+
+**`settings.json` deep-merge.** At session entry, the entrypoint reads global `settings.json` and the per-project overlay, deep-merges them (project wins on conflict), and writes the merged result to `C:\claude-data\settings.json` (where Claude reads). At session exit, the entrypoint reads back what Claude has now, computes the delta vs. the global baseline, and writes that delta to the per-project overlay. **Global is never mutated by sessions.** This is what closes the cross-project agent-persistence path: an MCP server installed by an agent in project A lands in project A's overlay, not in global, so project B's sessions don't see it.
+
+`cwc auth reset` wipes the shared auth dir cleanly when you want to start fresh.
+
+## Future work: host-side enforcement
+
+The strongest defense against agent-with-admin would be enforcement on the host, outside the container's reach. We investigated three paths during the design phase ([spike scripts](../tests/spikes/)):
+
+| Path | Result | Why |
+| --- | --- | --- |
+| Hyper-V Firewall (Win 11 22H2+) | Doesn't see Docker | Docker Desktop's Windows containers don't register a VM creator |
+| Hyper-V VM extended ACLs | Doesn't see Docker | `Get-VM` doesn't enumerate HCS-managed containers |
+| Windows Defender Firewall on the NAT bridge | Doesn't see container egress | VFP intercepts traffic below the WFP firewall layer |
+| HNS / VFP policies | **Viable, not yet built** | This is the layer Docker itself uses; needs `vfpctrl.exe` or HNS module scripting |
+
+The HNS/VFP path is real but a non-trivial implementation effort with deep ties to Docker Desktop's internals. v1 ships harden as a stronger in-container speed-bump and parks host-side enforcement as a v2 item. If you need real isolation today, the alternatives are:
+
+- A host-side outbound HTTPS proxy with FQDN allowlist (mitmproxy, squid). Forces all egress through a host-controlled choke point. Complicates setup; requires CA in the container's trust store.
+- A separate Windows VM running Docker Desktop, network-isolated at the hypervisor level. Real isolation, biggest setup cost.
+
+## Quick reference
+
+| Capability | Command |
+| --- | --- |
+| Toggle LAN lockdown | `cwc firewall enable` / `disable` |
+| Allow a subnet | `cwc firewall allow <cidr>` |
+| Map FQDN to host | `cwc firewall host-add <fqdn> [target] [ports]` |
+| Manage host-add denylist | `cwc firewall denylist {list,add,remove,reset}` |
+| Trust workspace files | `cwc trust` |
+| List trust state | `cwc trust list` |
+| Untrust this project | `cwc untrust` |
+| Reset shared auth | `cwc auth reset` |
+| Toggle harden | `cwc harden {enable,disable,status}` |
+
+## Reporting
+
+If you find a way to escape any of the above without admin in the container, please open an issue at <https://github.com/vinylflamingo/claude-win-container/issues>.

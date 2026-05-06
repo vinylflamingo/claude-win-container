@@ -119,6 +119,24 @@ jobs:
           # -Scope CurrentUser avoids needing elevated rights on the runner.
           Install-Module -Name PSScriptAnalyzer -Force -SkipPublisherCheck -Scope CurrentUser
 
+      # The Server Core base image runs PowerShell 5.1, which reads .ps1 files
+      # using the system ANSI code page (Windows-1252) unless they have a UTF-8
+      # BOM. UTF-8 multi-byte sequences (em-dash, arrows, ellipses, etc.) get
+      # mojibake'd and break the parser. Containing this to entrypoint.ps1
+      # keeps the rule checkable; the launcher (host-side) tolerates UTF-8 fine
+      # under PowerShell 7.
+      - name: Verify entrypoint.ps1 is ASCII-only
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes('entrypoint.ps1')
+          $bad = $bytes | Where-Object { $_ -gt 127 }
+          if ($bad) {
+              $unique = ($bad | Sort-Object -Unique | ForEach-Object { '0x{0:X2}' -f $_ }) -join ', '
+              Write-Host "::error file=entrypoint.ps1::contains non-ASCII bytes ($unique). PowerShell 5.1 in Server Core reads files with the ANSI code page; UTF-8 multi-byte chars break the parser at runtime. Replace em-dashes/arrows/ellipses with ASCII equivalents (--, ->, ...)."
+              exit 1
+          }
+          Write-Host "entrypoint.ps1: ASCII-clean ($($bytes.Length) bytes)"
+
       - name: Run PSScriptAnalyzer
         shell: pwsh
         run: |

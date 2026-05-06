@@ -16,7 +16,7 @@ services:
         BASE_IMAGE: ${CLAUDE_BASE_IMAGE:-mcr.microsoft.com/windows/servercore:ltsc2019}
         CLAUDE_NODE_VERSION: ${CLAUDE_NODE_VERSION:-20.18.0}
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
-    image: ${CWC_IMAGE:-vinylflamingo/claude-win-container:latest}
+    image: ${CWC_IMAGE:-fcostoya/claude-win-container:latest}
     stdin_open: true
     tty: true
     working_dir: C:\workspace
