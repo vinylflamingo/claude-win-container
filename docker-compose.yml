@@ -1,0 +1,53 @@
+# Sandboxed Claude Code — generic, project-agnostic.
+# This file is loaded by cwc.ps1 from any project directory. The launcher supplies
+# CLAUDE_WORKSPACE, CLAUDE_STATE_CONFIG, CLAUDE_STATE_HISTORY, CLAUDE_STATE_AUTH and forwards
+# only Claude-relevant env vars (see launcher for the allowlist).
+#
+# Per-project overlays (claude-sandbox.overlay.yml in the project root) layer on top.
+
+name: claude-sandbox
+
+services:
+  claude-code:
+    isolation: ${CLAUDE_ISOLATION:-hyperv}
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${CLAUDE_BASE_IMAGE:-mcr.microsoft.com/windows/servercore:ltsc2019}
+        CLAUDE_NODE_VERSION: ${CLAUDE_NODE_VERSION:-20.18.0}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+    image: ${CWC_IMAGE:-vinylflamingo/claude-win-container:latest}
+    stdin_open: true
+    tty: true
+    working_dir: C:\workspace
+    mem_limit: ${CLAUDE_MEM:-4g}
+    cpus: ${CLAUDE_CPUS:-2.0}
+    # Explicit env block — only Claude-relevant vars. The launcher passes additional
+    # forwarded keys via `docker compose run -e KEY=VAL` so they land here too.
+    environment:
+      CLAUDE_CONFIG_DIR: C:\claude-data
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # LAN-egress lockdown + host mappings (read by entrypoint.ps1)
+      CWC_LOCKDOWN_LAN: ${CWC_LOCKDOWN_LAN:-1}
+      CWC_ALLOW_NETS: ${CWC_ALLOW_NETS:-}
+      CWC_EXTRA_HOSTS: ${CWC_EXTRA_HOSTS:-}
+    volumes:
+      # Project workspace — bound RW so Claude can edit code.
+      - type: bind
+        source: ${CLAUDE_WORKSPACE}
+        target: C:\workspace
+      # Per-project Claude config (memory, sessions, settings).
+      - type: bind
+        source: ${CLAUDE_STATE_CONFIG}
+        target: C:\claude-data
+      # Per-project shell history.
+      - type: bind
+        source: ${CLAUDE_STATE_HISTORY}
+        target: C:\command-history
+      # Global auth (OAuth tokens, API key cache) — shared across projects.
+      - type: bind
+        source: ${CLAUDE_STATE_AUTH}
+        target: C:\claude-auth

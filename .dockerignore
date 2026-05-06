@@ -1,0 +1,11 @@
+.git/
+.github/
+docs/
+overlays/
+tests/
+examples/
+*.md
+LICENSE
+install.ps1
+.dockerignore
+.gitignore

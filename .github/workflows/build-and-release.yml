@@ -1,0 +1,137 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: vinylflamingo/claude-win-container
+
+jobs:
+  build:
+    name: Build (${{ matrix.base.tag }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        base:
+          - tag: ltsc2022
+            image: 'mcr.microsoft.com/windows/servercore:ltsc2022'
+            isolation: 'process'
+          - tag: ltsc2019
+            image: 'mcr.microsoft.com/windows/servercore:ltsc2019'
+            isolation: 'hyperv'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: vsn
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -like 'v*') {
+              $version = $env:GITHUB_REF_NAME.Substring(1)   # strip leading 'v'
+              $isRelease = 'true'
+          } else {
+              $version = "edge-$($env:GITHUB_SHA.Substring(0,7))"
+              $isRelease = 'false'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "is_release=$isRelease" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version  is_release=$isRelease"
+
+      - name: Build image (${{ matrix.base.tag }})
+        shell: pwsh
+        run: |
+          docker build `
+            --isolation=${{ matrix.base.isolation }} `
+            --build-arg BASE_IMAGE=${{ matrix.base.image }} `
+            -t ${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }} `
+            .
+
+      - name: Smoke test (${{ matrix.base.tag }})
+        shell: pwsh
+        run: |
+          $img = "${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }}"
+          $isolation = '${{ matrix.base.isolation }}'
+          docker run --rm --isolation=$isolation $img node --version
+          docker run --rm --isolation=$isolation $img git --version
+          docker run --rm --isolation=$isolation $img claude --version
+
+      - name: Login to Docker Hub
+        if: steps.vsn.outputs.is_release == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push base-tagged image
+        if: steps.vsn.outputs.is_release == 'true'
+        shell: pwsh
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }}
+
+      - name: Tag and push aliases
+        if: steps.vsn.outputs.is_release == 'true'
+        shell: pwsh
+        run: |
+          $version  = '${{ steps.vsn.outputs.version }}'
+          $baseTag  = '${{ matrix.base.tag }}'
+          $img      = '${{ env.IMAGE_NAME }}'
+          $sourceRef = "${img}:${version}-${baseTag}"
+
+          # latest-<base>
+          docker tag $sourceRef "${img}:latest-${baseTag}"
+          docker push "${img}:latest-${baseTag}"
+
+          # ltsc2019 also gets the bare semver and the bare `latest` (default = max compat)
+          if ($baseTag -eq 'ltsc2019') {
+              docker tag $sourceRef "${img}:${version}"
+              docker push "${img}:${version}"
+              docker tag $sourceRef "${img}:latest"
+              docker push "${img}:latest"
+          }
+
+  release:
+    name: Create GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Published Docker images for `${{ github.ref_name }}`:
+
+            | Tag | Base | Notes |
+            | --- | --- | --- |
+            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}` | ltsc2019 | default — max host compatibility |
+            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}-ltsc2019` | ltsc2019 | explicit |
+            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}-ltsc2022` | ltsc2022 | explicit |
+            | `${{ env.IMAGE_NAME }}:latest` | ltsc2019 | rolling |
+            | `${{ env.IMAGE_NAME }}:latest-ltsc2019` | ltsc2019 | rolling |
+            | `${{ env.IMAGE_NAME }}:latest-ltsc2022` | ltsc2022 | rolling |
+
+            **Quickstart:**
+            ```powershell
+            irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+            cd path\to\project
+            cwc
+            ```
+
+            To pin this version:
+            ```powershell
+            $env:CWC_IMAGE = '${{ env.IMAGE_NAME }}:${{ github.ref_name }}'
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

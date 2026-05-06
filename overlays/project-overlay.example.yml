@@ -1,0 +1,42 @@
+# Example per-project overlay for the Claude container.
+#
+# Copy this file to your project root as `claude-sandbox.overlay.yml` (gitignored
+# unless you want it committed) and adapt. cwc.ps1 auto-includes it when
+# present.
+#
+# Common use cases:
+#   - Attach to a docker-compose stack's network so Claude can reach services by short name
+#   - Map hostnames to host-gateway so Claude can hit Traefik/etc. on the host
+#   - Mount extra read-only paths (Obsidian vaults, design docs, runbooks)
+#   - Override mem/cpu limits for this project
+#
+# Container paths to be aware of (don't clobber):
+#   C:\workspace      project root (RW)
+#   C:\claude-data    per-project Claude config (RW)
+#   C:\command-history per-project shell history (RW)
+#   C:\claude-auth    global auth bind (RW)
+
+services:
+  claude-code:
+    # --- Example 1: attach to a sibling docker-compose stack's default network ---
+    # extra_hosts:
+    #   - "${CM_HOST}:host-gateway"
+    # networks:
+    #   - my-stack
+
+    # --- Example 2: mount a personal Obsidian vault read-only at C:\docs\obsidian ---
+    # volumes:
+    #   - type: bind
+    #     source: C:\Users\YOUR_USER\Documents\Obsidian\Sitecore
+    #     target: C:\docs\obsidian
+    #     read_only: true
+
+    # --- Example 3: override resource limits ---
+    # mem_limit: 8g
+    # cpus: 4.0
+    {}
+
+# networks:
+#   my-stack:
+#     name: ${COMPOSE_PROJECT_NAME:-mystack}_default
+#     external: true

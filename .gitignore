@@ -1,0 +1,15 @@
+# Local-only overlays / scratch
+*.local.yml
+*.local.ps1
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code working files
+.claude/
