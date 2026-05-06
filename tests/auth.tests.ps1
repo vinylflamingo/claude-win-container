@@ -27,7 +27,7 @@ Run-TestCase -Category auth -Name 'cross-project state is isolated' -Test {
     Should-Match $outA $marker -Because 'project A''s state should persist across sessions'
 }
 
-Run-TestCase -Category auth -Name 'auth-managed files propagate across projects' -Test {
+Run-TestCase -Category auth -Name 'whole-file global (.credentials.json) propagates across projects' -Test {
     Set-CwcConfig
 
     $projA = Join-Path (Split-Path $script:fixtures.workspace -Parent) 'proj-a'
@@ -37,15 +37,33 @@ Run-TestCase -Category auth -Name 'auth-managed files propagate across projects'
         if (-not (Test-Path (Join-Path $p '.git'))) { git init $p *> $null }
     }
 
-    # Auth-managed files live at C:\claude-data\<file> (CLAUDE_CONFIG_DIR). The entrypoint
-    # copies auth-relevant files (settings.json among them) back to C:\claude-auth\ on exit
-    # so they're shared. Writing directly to C:\claude-auth during a session is clobbered
-    # by that exit-time copy — write through claude-data instead, the way Claude itself does.
-    $marker = "auth-marker-$(Get-Random)"
-    $null = Invoke-InContainer "Set-Content C:\claude-data\settings.json -Value $marker" -WorkDir $projA
+    # Phase 3 narrowed the auth bind: only .credentials.json and mcp-needs-auth-cache.json
+    # are now whole-file global. settings.json is per-project (deep-merged with a global
+    # baseline at entry, delta-on-exit). Writing through claude-data is the path Claude
+    # itself uses; the entrypoint copies it back to claude-auth on exit.
+    $marker = "creds-marker-$(Get-Random)"
+    $null = Invoke-InContainer "Set-Content C:\claude-data\.credentials.json -Value '$marker'" -WorkDir $projA
 
-    # Project B starts fresh: entrypoint copies C:\claude-auth\settings.json (now containing
-    # A's marker) into B's per-project C:\claude-data\settings.json. So B sees A's marker.
+    $outB = Invoke-InContainer 'Get-Content C:\claude-data\.credentials.json -ErrorAction SilentlyContinue' -WorkDir $projB
+    Should-Match $outB $marker -Because '.credentials.json is whole-file global and must propagate'
+}
+
+Run-TestCase -Category auth -Name 'settings.json changes do NOT cross projects' -Test {
+    Set-CwcConfig
+
+    $projA = Join-Path (Split-Path $script:fixtures.workspace -Parent) 'proj-a'
+    $projB = Join-Path (Split-Path $script:fixtures.workspace -Parent) 'proj-b'
+    foreach ($p in @($projA, $projB)) {
+        if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
+        if (-not (Test-Path (Join-Path $p '.git'))) { git init $p *> $null }
+    }
+
+    # Closes the cross-project agent persistence vector — see docs/security.md, Phase 3.
+    $marker = "settings-marker-$(Get-Random)"
+    $cmdA = '$o = @{theme = "x"; agentMarker = "' + $marker + '"}; ' +
+            'Set-Content -LiteralPath C:\claude-data\settings.json -Value ($o | ConvertTo-Json)'
+    $null = Invoke-InContainer $cmdA -WorkDir $projA
+
     $outB = Invoke-InContainer 'Get-Content C:\claude-data\settings.json -ErrorAction SilentlyContinue' -WorkDir $projB
-    Should-Match $outB $marker -Because 'global-class files written from project A should propagate to project B via the auth bind'
+    Should-NotMatch $outB $marker -Because 'settings.json is per-project; agent edits in A must NOT appear in B'
 }

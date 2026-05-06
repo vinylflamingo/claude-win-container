@@ -48,6 +48,7 @@ $script:cwcManagedEnvVars = @(
     'CWC_LOCKDOWN_LAN',
     'CWC_ALLOW_NETS',
     'CWC_EXTRA_HOSTS',
+    'CWC_HARDEN',
     'CLAUDE_WORKSPACE',
     'CLAUDE_STATE_CONFIG',
     'CLAUDE_STATE_HISTORY',
@@ -100,23 +101,75 @@ function Invoke-InContainer {
 }
 
 # Write ~/.cwc/config.json with the given values. Replaces any existing config.
+# Accepts ExtraHosts in either old format ({fqdn -> '<target-string>'}) or new
+# Phase-4 format ({fqdn -> @{target=...; ports=@(...)}}); old-format strings are
+# auto-promoted to {target, ports=@(443,80)} so older tests stay readable.
 function Set-CwcConfig {
     param(
         [bool]$LockdownLan = $true,
         [string[]]$AllowNets = @(),
         [hashtable]$ExtraHosts = @{},
-        [hashtable]$Mounts = @{}
+        [hashtable]$Mounts = @{},
+        [string[]]$HostDenylist = $null,
+        [bool]$HardenEnabled = $false,
+        [hashtable]$TrustedFiles = $null
     )
+    $hostsOut = @{}
+    foreach ($k in $ExtraHosts.Keys) {
+        $v = $ExtraHosts[$k]
+        if ($v -is [string]) {
+            $hostsOut[$k] = @{ target = $v; ports = @(443, 80) }
+        } else {
+            $hostsOut[$k] = $v
+        }
+    }
+    if ($null -eq $HostDenylist) {
+        $HostDenylist = @(
+            '*.anthropic.com', 'anthropic.com',
+            '*.claude.ai',     'claude.ai',
+            '*.claude.com',    'claude.com',
+            '*.anthropic.ai',  'anthropic.ai'
+        )
+    }
+    if ($null -eq $TrustedFiles) { $TrustedFiles = @{} }
     $cfg = @{
-        lockdown_lan = $LockdownLan
-        allow_nets   = @($AllowNets)
-        extra_hosts  = $ExtraHosts
-        mounts       = $Mounts
+        lockdown_lan   = $LockdownLan
+        allow_nets     = @($AllowNets)
+        extra_hosts    = $hostsOut
+        mounts         = $Mounts
+        host_denylist  = @($HostDenylist)
+        harden_enabled = $HardenEnabled
+        trusted_files  = $TrustedFiles
     }
     $path = Join-Path $env:USERPROFILE '.cwc\config.json'
     $dir  = Split-Path -Parent $path
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    $cfg | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path
+}
+
+# Run a cwc subcommand on the HOST (not inside a container). Used for tests of
+# host-side commands like 'cwc firewall host-add', 'cwc trust', 'cwc harden status'
+# where the behaviour we're checking lives in cwc.ps1 itself, not in the container.
+# Returns a hashtable: @{ ExitCode = <int>; Output = <string> }.
+function Invoke-CwcOnHost {
+    param(
+        [Parameter(Mandatory)] [string[]]$Args,
+        [string]$WorkDir = $null
+    )
+    if ($WorkDir) { Push-Location $WorkDir }
+    try {
+        # *>&1 captures ALL streams (stdout, stderr, warning, verbose, debug,
+        # information). cwc.ps1 prints user-facing output via Write-Host, which
+        # goes to the information stream (6) on PS 5.1+. Plain 2>&1 misses that
+        # stream and yields empty captures, so we use *>&1.
+        $raw = & cwc @Args *>&1
+        return @{
+            ExitCode = $LASTEXITCODE
+            Output   = ($raw | Out-String)
+        }
+    } finally {
+        if ($WorkDir) { Pop-Location }
+    }
 }
 
 # Assertions
@@ -150,6 +203,15 @@ function Should-Equal {
     param($Actual, $Expected, [string]$Because = '')
     if ($Actual -ne $Expected) {
         $msg = "Expected '$Expected' but got '$Actual'"
+        if ($Because) { $msg += " (because: $Because)" }
+        throw $msg
+    }
+}
+
+function Should-NotEqual {
+    param($Actual, $Expected, [string]$Because = '')
+    if ($Actual -eq $Expected) {
+        $msg = "Expected NOT '$Expected' but got '$Actual'"
         if ($Because) { $msg += " (because: $Because)" }
         throw $msg
     }

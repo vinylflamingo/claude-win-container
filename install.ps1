@@ -114,19 +114,41 @@ if ($Test) {
 Write-Section "claude-win-container installer"
 Write-Host "This tool runs Claude Code inside a sandboxed Windows container."
 Write-Host ""
-Write-Host "Why the sandbox restricts network access:" -ForegroundColor Yellow
-Write-Host "  Claude (and any MCP server it spawns) can execute commands. By default"
-Write-Host "  we BLOCK the sandbox from reaching:"
-Write-Host "    - Other machines on your LAN (10/8, 172.16/12, 192.168/16, 169.254/16)"
-Write-Host "    - IPv6 link-local / unique-local addresses"
+Write-Host "What an AI coding agent can do:" -ForegroundColor Yellow
+Write-Host "  Claude (and any MCP server it loads) can run commands, read and write"
+Write-Host "  files, install packages, and make network requests on your behalf."
+Write-Host "  That's the point — but it also means an agent acting on a wrong"
+Write-Host "  instruction (or a prompt injection from text it reads) can do harm."
 Write-Host ""
-Write-Host "  Public internet remains accessible — Claude needs api.anthropic.com,"
-Write-Host "  npm, github, etc. to function."
+Write-Host "What we sandbox by default:" -ForegroundColor Yellow
+Write-Host "  - Filesystem    : agent sees only your project (mounted at C:\workspace)"
+Write-Host "                    plus a per-project state dir. Your home folder isn't"
+Write-Host "                    visible inside the container."
+Write-Host "  - Network       : public internet is allowed (Anthropic, npm, github);"
+Write-Host "                    LAN egress (10/8, 172.16/12, 192.168/16, 169.254/16,"
+Write-Host "                    IPv6 ULA / link-local) is blackholed."
+Write-Host "  - Auth scope    : OAuth tokens are shared across projects, but plugins"
+Write-Host "                    and project-scoped settings stay per-project — an"
+Write-Host "                    agent in one project can't plant code that runs in"
+Write-Host "                    another."
+Write-Host "  - Workspace     : changes to .env, .mcp.json, or claude-sandbox.overlay.yml"
+Write-Host "    trust           are detected and require explicit ack ('cwc trust') —"
+Write-Host "                    the agent can't silently expand the next session's"
+Write-Host "                    sandbox by editing files in the workspace."
 Write-Host ""
-Write-Host "  The next prompts let you allow specific exceptions for services you"
-Write-Host "  actually use (a Traefik on your host, a network printer, an internal"
-Write-Host "  API). Skip anything you're unsure about — you can always change it"
-Write-Host "  later with ``cwc firewall ...``"
+Write-Host "What we DON'T sandbox:" -ForegroundColor Yellow
+Write-Host "  - Public internet access. The agent can reach any public IP — npm"
+Write-Host "    packages, GitHub repos, arbitrary HTTPS endpoints. Code from npm"
+Write-Host "    runs inside the container. This is by design."
+Write-Host "  - Tool authority. Anything you allow the agent to run, it can run."
+Write-Host "    Permissions are configured per-project via Claude's settings."
+Write-Host ""
+Write-Host "It is YOUR decision what the agent should and should not be able to"
+Write-Host "access. cwc starts at the most restrictive defaults; you relax them"
+Write-Host "with ``cwc firewall ...``, ``cwc mount ...``, and ``cwc harden ...``"
+Write-Host "as your needs require."
+Write-Host ""
+Write-Host "Full security model + threat analysis: docs/security.md"
 Write-Host ""
 if ($interactive) { Read-PressEnter }
 
@@ -217,10 +239,11 @@ if (-not $SkipFirewallSetup) {
     Write-Host ""
 
     $config = [ordered]@{
-        lockdown_lan = $true
-        allow_nets   = @()
-        extra_hosts  = @{}
-        mounts       = @{}
+        lockdown_lan   = $true
+        allow_nets     = @()
+        extra_hosts    = @{}
+        mounts         = @{}
+        harden_enabled = $false
     }
 
     # Q1 — public internet (informational)
@@ -324,14 +347,42 @@ if (-not $SkipFirewallSetup) {
     }
     Write-Host ""
 
+    # Q6 — harden offer
+    Write-Host "6. Tamper-resistant hardening" -ForegroundColor Green
+    Write-Host "   The default LAN lockdown is enforced inside the container — code with"
+    Write-Host "   admin rights in the container (which Claude has) can disable it via"
+    Write-Host "   ``Remove-NetRoute``. 'Harden' adds an in-container watchdog that"
+    Write-Host "   re-applies the routes every 2s, restores the hosts file from snapshot"
+    Write-Host "   if changed, removes unauthorised routes, and logs new trust-store CAs."
+    Write-Host ""
+    Write-Host "   Trade-off: it's a bigger speed-bump, not real isolation. A determined"
+    Write-Host "   agent can still defeat it (kill the watchdog, race the loop). Real"
+    Write-Host "   isolation requires host-side enforcement which we haven't built yet"
+    Write-Host "   (see docs/security.md — host-side VFP enforcement is documented as"
+    Write-Host "   future work). Harden raises the realistic bar without that."
+    Write-Host ""
+    Write-Host "   Recommended: ON. You can toggle later with 'cwc harden enable/disable'."
+    if (Read-YesNo "   Enable hardening?" $true) {
+        $config.harden_enabled = $true
+        Write-Host "     ✓ harden enabled" -ForegroundColor DarkGray
+    } else {
+        $config.harden_enabled = $false
+        Write-Host "     × harden disabled" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
     # Summary + save
     Write-Section "Summary"
     Write-Host "  LAN lockdown : enabled"
+    Write-Host "  Harden       : $(if ($config.harden_enabled) { 'ENABLED' } else { 'disabled' })"
     Write-Host "  Allow CIDRs  : $(if ($config.allow_nets.Count) { $config.allow_nets -join ', ' } else { '(none)' })"
     if ($config.extra_hosts.Count -gt 0) {
         Write-Host "  Host mappings:"
         foreach ($k in $config.extra_hosts.Keys) {
-            Write-Host "    $k -> $($config.extra_hosts[$k])"
+            $entry = $config.extra_hosts[$k]
+            $target = if ($entry -is [string]) { $entry } else { $entry.target }
+            $ports  = if ($entry -is [hashtable] -and $entry.ports) { ($entry.ports -join ',') } else { '443,80 (default)' }
+            Write-Host "    $k -> $target  ports=$ports"
         }
     } else {
         Write-Host "  Host mappings: (none)"
@@ -351,11 +402,23 @@ if (-not $SkipFirewallSetup) {
     if (Read-YesNo "Save this config?" $true) {
         $cwcConfigDir = Split-Path -Parent $cwcConfigPath
         if (-not (Test-Path $cwcConfigDir)) { New-Item -ItemType Directory -Force -Path $cwcConfigDir | Out-Null }
+        # Migrate any string-valued extra_hosts entries to {target, ports} schema. The wizard
+        # itself doesn't add string values today, but defensive — older code paths may have.
+        $hostsOut = @{}
+        foreach ($k in $config.extra_hosts.Keys) {
+            $val = $config.extra_hosts[$k]
+            if ($val -is [string]) {
+                $hostsOut[$k] = @{ target = $val; ports = @(443, 80) }
+            } else {
+                $hostsOut[$k] = $val
+            }
+        }
         @{
-            lockdown_lan = $config.lockdown_lan
-            allow_nets   = @($config.allow_nets)
-            extra_hosts  = $config.extra_hosts
-            mounts       = $config.mounts
+            lockdown_lan   = $config.lockdown_lan
+            allow_nets     = @($config.allow_nets)
+            extra_hosts    = $hostsOut
+            mounts         = $config.mounts
+            harden_enabled = $config.harden_enabled
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cwcConfigPath
         Write-Host "  ✓ saved to $cwcConfigPath" -ForegroundColor Green
     } else {
@@ -380,7 +443,7 @@ if ($Test) {
     Write-Host "  cwc firewall allow <cidr>        # add a LAN allow"
     Write-Host ""
     Write-Host "Pin a specific image version:"
-    Write-Host "  `$env:CWC_IMAGE = 'vinylflamingo/claude-win-container:1.0.0'"
+    Write-Host "  `$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.0-alpha'"
     Write-Host ""
 }
 

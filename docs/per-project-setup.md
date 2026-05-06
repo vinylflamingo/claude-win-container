@@ -73,24 +73,69 @@ The launcher parses `$PWD/.env` and forwards a **curated** set of keys (it does 
 | `CLAUDE_*` | yes (consumer-defined Claude config) |
 | `ANTHROPIC_*` | yes |
 | Any `${KEY}` referenced in `.mcp.json` | yes |
+| `CWC_*` | **no** — sandbox flags, host shell env only (see [security.md](./security.md)) |
 | Anything else | **no** |
 
 Empty values are filtered out. Secrets (keys matching `KEY|TOKEN|SECRET|PASSWORD`) are masked in the startup banner.
 
 To extend the allowlist on a one-off basis, set the env var in your shell *before* invoking `cwc` — the launcher checks the process environment as a fallback when a key isn't in `.env`.
 
+`CWC_*` keys (`CWC_LOCKDOWN_LAN`, `CWC_ALLOW_NETS`, `CWC_EXTRA_HOSTS`, `CWC_HARDEN`) deliberately bypass the `.env` path. They control the sandbox itself, and the agent has RW on the workspace — letting `.env` drive them would let the agent silently disable the lockdown on the next launch. Persistent values go through `cwc firewall ...` / `cwc harden ...` (which write `~/.cwc/config.json`); one-shot overrides go through your shell.
+
 ## Optional: `claude-sandbox.overlay.yml`
 
 A docker-compose overlay the launcher auto-includes when present in the project root. Use it for things the base container deliberately doesn't bake in:
 
 - Attach the container to a sibling docker-compose stack's network (so Claude can reach `cm`, `db`, etc. by short hostname).
-- Map hostnames to `host-gateway` so requests hit Traefik on the host.
-- Mount extra read-only paths (Obsidian vaults, design specs, runbooks).
+- Mount extra read-only paths (Obsidian vaults, design specs, runbooks). For most cases prefer `cwc mount add` — same effect, no overlay needed.
 - Override mem/cpu limits for the project.
 
 Copy [`overlays/project-overlay.example.yml`](../overlays/project-overlay.example.yml) and adapt. **Do not** override the standard mount paths (`C:\workspace`, `C:\claude-data`, `C:\command-history`, `C:\claude-auth`).
 
 If you commit the overlay, future contributors get the same network/mounts automatically. If you'd rather keep it personal, gitignore it.
+
+> The overlay is **trusted explicitly per project**. The first time you run `cwc` in a project that contains an overlay (or after the file's contents change), the launcher prompts you to confirm before loading it. Run `cwc trust` to ack the current state. See [`security.md`](./security.md) for why.
+
+## Trust system
+
+Three files in your project root drive what flows into the next session:
+
+| File | Effect on the next session |
+| --- | --- |
+| `claude-sandbox.overlay.yml` | Compose overlay auto-loaded by the launcher — can add mounts, attach networks, change isolation. |
+| `.env` | Environment variables forwarded into the container (per the allowlist above). |
+| `.mcp.json` | MCP servers + extra `${KEY}` references that get forwarded from your shell env. |
+
+The agent has RW on the workspace, which means it can edit any of these files. Without something stopping it, the agent could silently expand its next session's sandbox by editing the workspace.
+
+The trust system tracks per-project SHA-256 of these three files in `~/.cwc/config.json` under `trusted_files["<project-slug>"]`. Before launching the container, the launcher checks each tracked file's hash against what was stored last time you ran `cwc trust`. The behaviour on mismatch:
+
+- **Interactive session** (real terminal): the launcher shows per-file status (`trusted` / `NEW` / `MODIFIED` / `DELETED`) and prompts `Trust current state and continue? [y/N]`. Answering `y` saves the new hashes and proceeds.
+- **Non-interactive session** (CI, scripted, redirected stdin): the launcher refuses to launch with a clear `Run 'cwc trust' to acknowledge` message. No silent inheritance.
+
+### First run in a project
+
+The first time you run `cwc` in a project that has any of the three tracked files, you'll see the trust prompt. This is intentional — even a fresh-from-clone repo should require an explicit ack before the agent inherits whatever overlay/env/mcp config is committed there. Trust on first use, not silent first use.
+
+If the project has none of those files (e.g. a Python project with only `pyproject.toml`), no prompt — there's nothing to trust.
+
+### Managing trust state
+
+```powershell
+cwc trust              # ack the current state of all tracked files in this project
+cwc trust list         # show the per-file status without changing anything
+cwc untrust            # drop trust state for this project (forces a re-prompt next launch)
+```
+
+`cwc untrust` is useful after pulling a PR with overlay/`.env`/`.mcp.json` changes — it forces the next `cwc` to re-prompt so you'll see what was added/changed before it takes effect.
+
+### What the trust system does NOT cover
+
+- **Project source code.** The agent has RW on the workspace; that's the point. Trust covers only the three sandbox-driving files above.
+- **Determined adversaries.** The trust prompt is a guard rail. If you click `y` without reading the diff, you've trusted whatever was added. Use `cwc trust list` first if you're not sure what changed.
+- **The OAuth token / API key.** Those are not trust-tracked because they live outside the workspace (in `~/.claude-win-container/auth/.credentials.json`).
+
+For the wider security model, see [`security.md`](./security.md).
 
 ## Optional: `.gitignore` additions
 
@@ -102,26 +147,32 @@ claude-sandbox.overlay.yml
 
 ## State location
 
-Everything Claude writes about the *project* lives at:
+Everything Claude writes for *this project* lives at:
 
 ```
 %USERPROFILE%\.claude-win-container\projects\<basename>-<sha1[0..11]>\
-  config\        # CLAUDE_CONFIG_DIR (memory, sessions, todos, plans, history.jsonl)
-  history\       # shell command history
+  config\                       # CLAUDE_CONFIG_DIR (sessions, todos, plans, history.jsonl)
+    settings.json               #   merged result Claude reads (regenerated each session)
+    settings-project.json       #   per-project delta vs. global (this project's overrides)
+    plugins\                    #   per-project plugins (was global pre-overhaul; moved)
+    cache\, statsig\, telemetry\ #  per-project caches
+    sessions\, todos\, plans\, projects\, ...
+  history\                      # shell history (per-project)
 ```
 
-Auth (OAuth tokens, API key cache, plugins, shared user prefs) is shared across projects:
+Shared across all projects (just OAuth tokens + global preferences):
 
 ```
 %USERPROFILE%\.claude-win-container\auth\
-  .credentials.json
-  settings.json
-  plugins/
-  cache/
-  ...
+  .credentials.json             # OAuth tokens (whole-file global, refreshed by Claude)
+  mcp-needs-auth-cache.json     # small cache (whole-file global)
+  settings.json                 # global preferences (theme, telemetry, autoUpdater); deep-merged
+                                # with per-project settings-project.json on entry, never mutated by sessions
 ```
 
 The slug is stable: `<basename>-<sha1[0..11]>` of the absolute project path. Two projects with the same basename get different slugs (different paths → different sha1).
+
+`settings.json` is **per-project effectively** — see [`security.md`](./security.md) for how the deep-merge works. Anything an agent installs (MCP servers, hooks, permissions) lands in the per-project overlay, not global. So an agent in project A can't plant config that runs in project B.
 
 ## Checking what gets forwarded
 

@@ -42,7 +42,7 @@ irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/in
 cwc
 ```
 
-Runs `claude` inside the container against the current directory. First run pulls the image (`vinylflamingo/claude-win-container:latest`) from Docker Hub if it isn't local. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
+Runs `claude` inside the container against the current directory. First run pulls the image (`fcostoya/claude-win-container:latest`) from Docker Hub if it isn't local. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
 
 ### `cwc <command> [args...]`
 
@@ -169,17 +169,31 @@ cwc firewall host-list
 
 List the persistent FQDN → target mappings the entrypoint will write to the container's `hosts` file.
 
-### `cwc firewall host-add <fqdn> [target]`
+### `cwc firewall host-add <fqdn> [target] [ports]`
 
 ```powershell
-cwc firewall host-add cm.ion.localhost                # default target = host-gateway
-cwc firewall host-add internal-api.local              # also defaults to host-gateway
-cwc firewall host-add legacy.box 10.5.1.20            # explicit IP
+cwc firewall host-add cm.ion.localhost                       # default: host-gateway, ports 443,80
+cwc firewall host-add internal-api.local host-gateway 443    # 443 only
+cwc firewall host-add legacy.box 10.5.1.20 8080              # explicit IP, port 8080
+cwc firewall host-add db.local host-gateway 5432             # postgres on host
 ```
 
-Add a hosts-file mapping inside the container. With the default `host-gateway` target, the entrypoint resolves it to the Docker host's IP at runtime and pokes a /32 hole through the lockdown so traffic actually flows. With an explicit IP target in a private range, you'll need a corresponding `cwc firewall allow <cidr>` for it to be reachable.
+Add a host mapping. The entrypoint allocates a per-FQDN loopback IP (`127.0.0.X`), sets up `netsh portproxy` for each listed port, and writes the FQDN → loopback into the container's hosts file. Result: the agent reaches `<fqdn>:<listed-port>` via portproxy; other ports on that FQDN aren't bound and are unreachable.
 
-This is the easiest way to make services running on the Docker host (Traefik, a local API, etc.) reachable from inside the container by name.
+`cwc firewall host-add` refuses any FQDN matching the denylist (`*.anthropic.com`, etc.) — see [`denylist`](#cwc-firewall-denylist-listaddremovereset) below.
+
+For an explicit IP target in a private range, you also need a corresponding `cwc firewall allow <cidr>` so the lockdown doesn't blackhole it.
+
+### `cwc firewall denylist {list|add|remove|reset}`
+
+```powershell
+cwc firewall denylist list                            # show active denylist
+cwc firewall denylist add internal.example.com        # add a custom entry
+cwc firewall denylist remove *.example.com            # remove (prompts if it's a default)
+cwc firewall denylist reset                           # reset to defaults
+```
+
+FQDNs that `cwc firewall host-add` will refuse. Defaults cover Anthropic's auth-bearing channels (`*.anthropic.com`, `*.claude.ai`, `*.claude.com`, `*.anthropic.ai`) — preventing hosts-file injection from being used to MITM the API key. Custom entries let you protect additional FQDNs you care about (corporate auth, banking, etc.).
 
 ### `cwc firewall host-remove <fqdn>`
 
@@ -188,6 +202,59 @@ cwc firewall host-remove cm.ion.localhost
 ```
 
 Remove a mapping. The `hosts` file inside the next session won't include it.
+
+---
+
+## `cwc trust` — workspace policy file trust
+
+Three files in your project drive what flows into the next session — `claude-sandbox.overlay.yml`, `.env`, `.mcp.json`. The agent has RW on the workspace, so any of these can be agent-edited. The trust system tracks a per-project SHA-256 of each and refuses to launch when they change without explicit ack. See [`security.md`](./security.md) for the threat model.
+
+### `cwc trust`
+
+```powershell
+cwc trust                  # trust the current state of all tracked files in this project
+```
+
+Records SHA-256 hashes of the tracked files into `~/.cwc/config.json` under `trusted_files["<project-slug>"]`. Run this after legitimately editing one of the tracked files to dismiss the launch-time prompt.
+
+### `cwc trust list`
+
+```powershell
+cwc trust list             # show trust state for tracked files in this project
+```
+
+Per-file status: `trusted` (current matches stored hash), `NEW` (file exists but isn't trusted), `MODIFIED` (file changed since last trust), `DELETED` (was trusted, now missing), `absent` (not present, never trusted).
+
+### `cwc untrust`
+
+```powershell
+cwc untrust                # remove trust for this project; next 'cwc' will re-prompt
+```
+
+Wipes the per-project trust map. Useful if you want to force a fresh trust prompt (e.g., after a teammate sends you a PR with policy file changes).
+
+---
+
+## `cwc auth` — shared auth state
+
+```powershell
+cwc auth where             # print where shared and per-project state live
+cwc auth reset             # wipe shared auth (~/.claude-win-container/auth/) — re-auth on next run
+```
+
+Per-project state (sessions, plugins, settings overlay) is unaffected by `auth reset`.
+
+---
+
+## `cwc harden` — tamper-resistant in-container hardening
+
+Opt-in. When enabled, the container runs an in-container watchdog every 2 seconds that re-applies blackhole routes, restores the hosts file from snapshot if changed, removes unauthorized `/32` allow-routes to RFC1918, and logs new trust-store CAs. Off by default — turn on if you want a higher bar against agent tampering. Not real isolation; see [`security.md`](./security.md) for the trade-offs.
+
+```powershell
+cwc harden enable          # turn on; takes effect on next 'cwc' session
+cwc harden disable         # turn off
+cwc harden status          # show state + what gets enforced + the limitations
+```
 
 ---
 
@@ -239,22 +306,19 @@ All read by the launcher and/or the entrypoint. Setting them in your shell or yo
 
 | Variable | Description |
 | --- | --- |
-| `CWC_IMAGE` | Pin a specific image. Default: `vinylflamingo/claude-win-container:latest`. |
+| `CWC_IMAGE` | Pin a specific image. Default: `fcostoya/claude-win-container:latest`. |
 | `CWC_LOCKDOWN_LAN` | `1` (default) enables the LAN lockdown; `0` disables it. |
 | `CWC_ALLOW_NETS` | Comma-separated CIDRs to re-allow (e.g. `192.168.50.0/24,10.5.0.0/16`). Merged with the user-wide allow-list. |
-| `CWC_EXTRA_HOSTS` | Comma-separated `fqdn:target` pairs (e.g. `cm.ion.localhost:host-gateway,api:10.5.1.20`). Set automatically by `cwc firewall host-add`; can also be set per-session/per-project. |
+| `CWC_EXTRA_HOSTS` | Pipe-separated `fqdn|target|port,port` entries joined by `;` (e.g. `cm.local|host-gateway|443,80;db|10.5.1.20|5432`). Set automatically by `cwc firewall host-add`. |
+| `CWC_HARDEN` | `1` enables the in-container watchdog; `0` (default) disables. |
 
 ```powershell
 # One-off override in the current shell:
 $env:CWC_LOCKDOWN_LAN = '0'
 cwc
-
-# Persistent per-project, in .env:
-# CWC_ALLOW_NETS=192.168.50.0/24
-# CWC_EXTRA_HOSTS=cm.ion.localhost:host-gateway
 ```
 
-The launcher auto-forwards any `CWC_*` key from `.env` into the container.
+`CWC_*` keys are read from your **shell environment** only. They are deliberately *not* forwarded from the project's `.env` — the agent has RW on the workspace, so allowing `.env` to drive sandbox flags would let it disable the lockdown silently. Persistent settings go through `cwc firewall ...` (writes `~/.cwc/config.json`); per-session overrides go through your shell. See [`security.md`](./security.md) for the rationale.
 
 ---
 

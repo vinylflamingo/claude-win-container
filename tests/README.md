@@ -5,15 +5,20 @@ Layer 1 isolation tests — deterministic, OS-level. Each test sets a known cwc 
 ## Run
 
 ```powershell
-# Full suite
+# Full suite (uses the published image — won't reflect uncommitted entrypoint.ps1 changes)
 .\tests\run.ps1
 
+# Build a fresh image from the local Dockerfile before running. REQUIRED when
+# iterating on entrypoint.ps1 or Dockerfile — otherwise you're testing the
+# published image, not your changes.
+.\tests\run.ps1 -Build
+
 # Pin a specific image (useful in CI for the matrix builds)
-.\tests\run.ps1 -Image vinylflamingo/claude-win-container:1.2.3-ltsc2019
+.\tests\run.ps1 -Image fcostoya/claude-win-container:0.1.0-alpha-ltsc2019
 
 # Subset by name/category regex
 .\tests\run.ps1 -Filter network
-.\tests\run.ps1 -Filter 'mount|workspace'
+.\tests\run.ps1 -Filter 'denylist|trust'   # host-only suite, ~10s, no Docker
 
 # Keep fixtures + config snapshot for inspection after a failure
 .\tests\run.ps1 -NoCleanup
@@ -26,19 +31,24 @@ The runner snapshots your real `~/.cwc/config.json` before the suite and restore
 | File | Scope |
 | --- | --- |
 | `filesystem.tests.ps1` | Workspace bind mount, host-path invisibility, configured RO/RW mounts at `C:\docs\<name>`, missing-source mount handling |
-| `network.tests.ps1` | LAN-egress lockdown blackhole routes, allow-CIDR pinholes, public-internet reachability, host-gateway hosts file write + /32 allow, env override |
+| `network.tests.ps1` | LAN-egress lockdown blackhole routes, allow-CIDR pinholes, public-internet reachability, host-gateway portproxy + loopback hosts file mapping + /32 allow, env override |
 | `auth.tests.ps1` | Per-project state isolation, shared global auth dir |
+| `denylist.tests.ps1` | Host-side: `cwc firewall host-add` denylist enforcement, FQDN/target validation, denylist add/remove/reset |
+| `trust.tests.ps1` | Host-side: `cwc trust`/`untrust`, trust state detection for `.env`/`.mcp.json`/`claude-sandbox.overlay.yml` |
+| `settings-merge.tests.ps1` | Container: settings.json deep-merge of global + per-project overlay, project additions never mutate global |
+| `harden.tests.ps1` | Container: watchdog re-applies removed blackhole, removes unauthorized routes, restores hosts file |
 
-Each test takes ~5–15 seconds (container startup dominates). Full suite is ~3–5 minutes.
+Container tests take ~5–15 seconds each (container startup dominates); host-only tests (`denylist`, `trust`) are ~1s each. Full suite is ~5–8 minutes with harden tests' 6s sleeps.
 
 ## Adding tests
 
 Drop a new `*.tests.ps1` file in this directory; the runner auto-discovers them. Available helpers (from `lib/harness.ps1`):
 
 - `Run-TestCase -Category <name> -Name <test> -Test { ... }` — wrap each assertion
-- `Set-CwcConfig -LockdownLan <bool> -AllowNets @(...) -ExtraHosts @{} -Mounts @{}` — replace `~/.cwc/config.json`
-- `Invoke-InContainer 'powershell-command' [-WorkDir <path>]` — run inside a one-shot container; defaults to the fixture workspace
-- `Should-Match`, `Should-NotMatch`, `Should-BeTrue`, `Should-Equal` — throw on failure with helpful messages
+- `Set-CwcConfig [-LockdownLan <bool>] [-AllowNets @(...)] [-ExtraHosts @{}] [-Mounts @{}] [-HostDenylist @(...)] [-HardenEnabled <bool>] [-TrustedFiles @{}]` — replace `~/.cwc/config.json` with a known state. Each call writes the full config; defaults are conservative (lockdown on, harden off, default Anthropic denylist).
+- `Invoke-InContainer 'powershell-command' [-WorkDir <path>] [-Env @{}]` — run inside a one-shot container; defaults to the fixture workspace. Use this for tests that exercise entrypoint / container behaviour.
+- `Invoke-CwcOnHost -Args @('firewall','host-add','...') [-WorkDir <path>]` — run a `cwc` subcommand on the host (no container start). Captures all PowerShell streams via `*>&1`. Use this for host-side commands like trust, denylist, harden config. Returns `@{ ExitCode = ...; Output = ... }`.
+- `Should-Match`, `Should-NotMatch`, `Should-BeTrue`, `Should-Equal`, `Should-NotEqual` — throw on failure with helpful messages
 
 ## What this doesn't test
 
