@@ -1,19 +1,177 @@
 name: Build and release
 
+# Branch-driven CI/CD. Three categories of branches, three behaviours:
+#
+#   release/<semver>    → full pipeline: lint → test → build → smoke → push to
+#                          Docker Hub (incl. `latest` tags) → GitHub release
+#                          → open PR from this branch back to main.
+#
+#   preview/<anything>  → same publishing flow as release: lint → test → build
+#                          → smoke → push to Docker Hub (NO `latest` tags) →
+#                          GitHub *pre-release*. NO auto-PR to main. For
+#                          end-to-end validation of the publish pipeline before
+#                          cutting a real release.
+#
+#   anything else       → no run. Feature branches, main, and every other branch
+#                          are deliberately ignored. Use preview/* to validate.
+#
+# `main` is post-release state only. Pushing to main directly does NOT trigger
+# any jobs — main is updated via the auto-opened PR after a release succeeds.
+#
+# Tag pushes are no longer a trigger. Tags are CREATED by the release job
+# (softprops/action-gh-release tags the commit at release time).
+
 on:
   push:
-    branches: [main]
-    tags: ['v*.*.*']
-  pull_request:
-    branches: [main]
+    branches:
+      - 'release/**'
+      - 'preview/**'
   workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you running this manually?'
+        required: false
+        default: 'manual debug'
 
 env:
-  IMAGE_NAME: vinylflamingo/claude-win-container
+  IMAGE_NAME: fcostoya/claude-win-container
 
 jobs:
+  # Single source of truth for what the rest of the workflow does.
+  # Parses GITHUB_REF_NAME into version + branch_kind + is_release + is_publishable
+  # outputs; downstream jobs reference these via needs.classify.outputs.*.
+  #
+  # Distinctions:
+  #   is_publishable = "push images to Docker Hub + create a GitHub release"
+  #                  → true for release/ AND preview/
+  #   is_release     = "this is a stable release"
+  #                  → true for release/ only; gates `latest` tags + auto-PR
+  #                  → preview/ runs the publish flow but doesn't claim `latest`
+  classify:
+    name: Classify branch
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.classify.outputs.version }}
+      branch_kind: ${{ steps.classify.outputs.branch_kind }}
+      is_release: ${{ steps.classify.outputs.is_release }}
+      is_publishable: ${{ steps.classify.outputs.is_publishable }}
+    steps:
+      - id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME}"
+
+          if [[ "$BRANCH" == release/* ]]; then
+            VERSION="${BRANCH#release/}"
+            # Strict semver for releases: 1.2.3, 1.2.3-rc.1, 1.2.3+build.5, etc.
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$ ]]; then
+              echo "::error::release/* branches must use a semver suffix (got '$VERSION'). Examples: release/1.0.1, release/1.0.1-rc.1, release/2.0.0+build.5"
+              exit 1
+            fi
+            BRANCH_KIND="release"
+            IS_RELEASE="true"
+            IS_PUBLISHABLE="true"
+          elif [[ "$BRANCH" == preview/* ]]; then
+            # Preview accepts any suffix; sanitise for Docker tag rules
+            # (replace / with -; valid Docker tag chars: [a-zA-Z0-9._-]).
+            # Convention is semver-with-prerelease-suffix (1.0.1-rc.1) so it
+            # composes with release tags cleanly, but ad-hoc names work too.
+            VERSION="${BRANCH#preview/}"
+            VERSION="${VERSION//\//-}"
+            BRANCH_KIND="preview"
+            IS_RELEASE="false"
+            IS_PUBLISHABLE="true"
+          else
+            # workflow_dispatch from any non-release/non-preview branch.
+            # Builds + smoke-tests but doesn't publish or create a release.
+            VERSION="edge-${GITHUB_SHA:0:7}"
+            BRANCH_KIND="other"
+            IS_RELEASE="false"
+            IS_PUBLISHABLE="false"
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "branch_kind=$BRANCH_KIND"
+            echo "is_release=$IS_RELEASE"
+            echo "is_publishable=$IS_PUBLISHABLE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Branch:        $BRANCH"
+          echo "Kind:          $BRANCH_KIND"
+          echo "Version:       $VERSION"
+          echo "Publishable:   $IS_PUBLISHABLE"
+          echo "Stable release: $IS_RELEASE"
+
+  lint:
+    name: Lint PowerShell
+    needs: classify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # -Force skips the "untrusted repository" prompt; -SkipPublisherCheck
+          # skips Authenticode verification (PSGallery modules aren't signed).
+          # -Scope CurrentUser avoids needing elevated rights on the runner.
+          Install-Module -Name PSScriptAnalyzer -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # Exclude PSAvoidUsingWriteHost — Write-Host is the *correct* choice
+          # for user-facing CLI output in cwc.ps1 / install.ps1, and PowerShell 5+
+          # routes it through the information stream anyway. Other rules apply.
+          $rulesToExclude = @('PSAvoidUsingWriteHost')
+
+          $files = Get-ChildItem -Recurse -Include '*.ps1','*.psm1','*.psd1' |
+                   Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+
+          Write-Host "Analyzing $($files.Count) PowerShell file(s)..."
+          $issues = foreach ($f in $files) {
+              Invoke-ScriptAnalyzer -Path $f.FullName -ExcludeRule $rulesToExclude
+          }
+
+          $errors   = @($issues | Where-Object Severity -eq 'Error')
+          $warnings = @($issues | Where-Object Severity -eq 'Warning')
+
+          if ($errors.Count -gt 0) {
+              Write-Host "PSScriptAnalyzer errors:" -ForegroundColor Red
+              $errors | Format-Table ScriptName, Line, RuleName, Message -AutoSize -Wrap
+          }
+          if ($warnings.Count -gt 0) {
+              Write-Host "PSScriptAnalyzer warnings (non-blocking):" -ForegroundColor Yellow
+              $warnings | Format-Table ScriptName, Line, RuleName, Message -AutoSize -Wrap
+          }
+
+          Write-Host ""
+          Write-Host "Summary: errors=$($errors.Count), warnings=$($warnings.Count)"
+
+          if ($errors.Count -gt 0) {
+              throw "PSScriptAnalyzer found $($errors.Count) Error-level issue(s) above; fix before merging."
+          }
+
+  test-host:
+    name: Host-side tests
+    needs: classify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run host-only tests
+        shell: pwsh
+        run: |
+          # Host-only test subset — exercises cwc.ps1 directly, no Docker.
+          # Container-side tests (network, settings-merge, harden) require the
+          # built image and are not in CI; run them locally via .\tests\run.ps1 -Build.
+          .\tests\run.ps1 -Filter 'denylist|trust'
+
   build:
     name: Build (${{ matrix.base.tag }})
+    needs: [classify, lint, test-host]
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -25,113 +183,186 @@ jobs:
           - tag: ltsc2019
             image: 'mcr.microsoft.com/windows/servercore:ltsc2019'
             isolation: 'hyperv'
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Determine version
-        id: vsn
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -like 'v*') {
-              $version = $env:GITHUB_REF_NAME.Substring(1)   # strip leading 'v'
-              $isRelease = 'true'
-          } else {
-              $version = "edge-$($env:GITHUB_SHA.Substring(0,7))"
-              $isRelease = 'false'
-          }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "is_release=$isRelease" >> $env:GITHUB_OUTPUT
-          Write-Host "version=$version  is_release=$isRelease"
 
       - name: Build image (${{ matrix.base.tag }})
         shell: pwsh
         run: |
+          $version = '${{ needs.classify.outputs.version }}'
+          $tag     = '${{ matrix.base.tag }}'
+          $img     = '${{ env.IMAGE_NAME }}'
+
           docker build `
             --isolation=${{ matrix.base.isolation }} `
             --build-arg BASE_IMAGE=${{ matrix.base.image }} `
-            -t ${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }} `
+            -t "${img}:${version}-${tag}" `
             .
 
       - name: Smoke test (${{ matrix.base.tag }})
         shell: pwsh
         run: |
-          $img = "${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }}"
+          $img       = "${{ env.IMAGE_NAME }}:${{ needs.classify.outputs.version }}-${{ matrix.base.tag }}"
           $isolation = '${{ matrix.base.isolation }}'
           docker run --rm --isolation=$isolation $img node --version
           docker run --rm --isolation=$isolation $img git --version
           docker run --rm --isolation=$isolation $img claude --version
 
       - name: Login to Docker Hub
-        if: steps.vsn.outputs.is_release == 'true'
+        if: needs.classify.outputs.is_publishable == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push base-tagged image
-        if: steps.vsn.outputs.is_release == 'true'
+      - name: Push base-tagged image (release + preview)
+        if: needs.classify.outputs.is_publishable == 'true'
         shell: pwsh
         run: |
-          docker push ${{ env.IMAGE_NAME }}:${{ steps.vsn.outputs.version }}-${{ matrix.base.tag }}
+          docker push ${{ env.IMAGE_NAME }}:${{ needs.classify.outputs.version }}-${{ matrix.base.tag }}
 
-      - name: Tag and push aliases
-        if: steps.vsn.outputs.is_release == 'true'
+      # Bare-semver tag (e.g. `1.0.1` or `1.0.1-rc.1`) for ltsc2019 only —
+      # ltsc2019 is the "default" base. Pushed for both release and preview so
+      # users can pull a specific preview by exact tag.
+      - name: Push bare-version alias
+        if: needs.classify.outputs.is_publishable == 'true' && matrix.base.tag == 'ltsc2019'
         shell: pwsh
         run: |
-          $version  = '${{ steps.vsn.outputs.version }}'
+          $version  = '${{ needs.classify.outputs.version }}'
+          $img      = '${{ env.IMAGE_NAME }}'
+          $sourceRef = "${img}:${version}-ltsc2019"
+          docker tag $sourceRef "${img}:${version}"
+          docker push "${img}:${version}"
+
+      # `latest`, `latest-ltsc2019`, `latest-ltsc2022` always point to the most
+      # recent STABLE release. Previews don't update them — that's how the
+      # "test the pipeline without claiming latest" guarantee works.
+      - name: Push `latest` aliases (release only)
+        if: needs.classify.outputs.is_release == 'true'
+        shell: pwsh
+        run: |
+          $version  = '${{ needs.classify.outputs.version }}'
           $baseTag  = '${{ matrix.base.tag }}'
           $img      = '${{ env.IMAGE_NAME }}'
           $sourceRef = "${img}:${version}-${baseTag}"
 
-          # latest-<base>
           docker tag $sourceRef "${img}:latest-${baseTag}"
           docker push "${img}:latest-${baseTag}"
 
-          # ltsc2019 also gets the bare semver and the bare `latest` (default = max compat)
           if ($baseTag -eq 'ltsc2019') {
-              docker tag $sourceRef "${img}:${version}"
-              docker push "${img}:${version}"
               docker tag $sourceRef "${img}:latest"
               docker push "${img}:latest"
           }
 
   release:
     name: Create GitHub release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [classify, build]
+    if: needs.classify.outputs.is_publishable == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # needed to create the tag + release
     steps:
       - uses: actions/checkout@v4
 
+      # Extract the matching CHANGELOG section, append a generated image table
+      # + quickstart, and write release-body.md. See scripts/build-release-body.sh.
+      # PREVIEW_BANNER prepends a "this is a pre-release" notice.
+      - name: Build release body from CHANGELOG
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          PREVIEW_BANNER: ${{ needs.classify.outputs.branch_kind == 'preview' && '1' || '' }}
+        run: |
+          bash scripts/build-release-body.sh "${{ needs.classify.outputs.version }}"
+          echo "----- release-body.md -----"
+          cat release-body.md
+          echo "----- end -----"
+
+      # softprops/action-gh-release creates the tag at HEAD and the release.
+      # `prerelease: true` for preview branches → GitHub shows a yellow badge
+      # and excludes it from "Latest release" on the repo page.
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          body: |
-            Published Docker images for `${{ github.ref_name }}`:
-
-            | Tag | Base | Notes |
-            | --- | --- | --- |
-            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}` | ltsc2019 | default — max host compatibility |
-            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}-ltsc2019` | ltsc2019 | explicit |
-            | `${{ env.IMAGE_NAME }}:${{ github.ref_name }}-ltsc2022` | ltsc2022 | explicit |
-            | `${{ env.IMAGE_NAME }}:latest` | ltsc2019 | rolling |
-            | `${{ env.IMAGE_NAME }}:latest-ltsc2019` | ltsc2019 | rolling |
-            | `${{ env.IMAGE_NAME }}:latest-ltsc2022` | ltsc2022 | rolling |
-
-            **Quickstart:**
-            ```powershell
-            irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
-            cd path\to\project
-            cwc
-            ```
-
-            To pin this version:
-            ```powershell
-            $env:CWC_IMAGE = '${{ env.IMAGE_NAME }}:${{ github.ref_name }}'
-            ```
+          tag_name: v${{ needs.classify.outputs.version }}
+          name: v${{ needs.classify.outputs.version }}
+          body_path: release-body.md
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.classify.outputs.branch_kind == 'preview' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  post-release-pr:
+    name: Open PR to main
+    needs: [classify, release]
+    # Only release/* gets the auto-PR to main. Previews are for validation;
+    # they never promote to main automatically (that's the whole point of
+    # having a separate channel).
+    if: needs.classify.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # needed to create the PR
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open or update PR from release branch to main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.classify.outputs.version }}'
+          BRANCH='${{ github.ref_name }}'
+          REPO='${{ github.repository }}'
+
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
+          DOCKERHUB_URL="https://hub.docker.com/r/${IMAGE_NAME}/tags"
+
+          BODY=$(cat <<EOF
+          Automated PR opened after a successful release of \`v${VERSION}\` from \`${BRANCH}\`.
+
+          - GitHub release: ${RELEASE_URL}
+          - Docker Hub tags: ${DOCKERHUB_URL}
+
+          ## What this PR does
+
+          Merges the release branch into \`main\` so \`main\` reflects the post-release state. Per project policy:
+
+          - \`main\` only ever holds post-release code.
+          - This PR is the only path for code to reach \`main\`.
+
+          ## Before merging, verify
+
+          - [ ] The release at the link above looks correct (CHANGELOG section, image table).
+          - [ ] All six Docker Hub tags are present (\`v${VERSION}\`, \`v${VERSION}-ltsc2019\`, \`v${VERSION}-ltsc2022\`, \`latest\`, \`latest-ltsc2019\`, \`latest-ltsc2022\`).
+          - [ ] No critical issues surfaced post-release.
+
+          ---
+
+          _Opened by the \`Build and release\` workflow._
+          EOF
+          )
+
+          # Idempotency: if a PR is already open for this branch → main, leave
+          # it alone (re-running the release flow shouldn't duplicate PRs).
+          EXISTING=$(gh pr list \
+            --repo "$REPO" \
+            --head "$BRANCH" \
+            --base main \
+            --state open \
+            --json number,url \
+            --jq '.[0]' || echo '')
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            PR_URL=$(echo "$EXISTING" | jq -r '.url')
+            PR_NUM=$(echo "$EXISTING" | jq -r '.number')
+            echo "PR already open for ${BRANCH} → main: #${PR_NUM} (${PR_URL})"
+            echo "Not creating a duplicate."
+          else
+            gh pr create \
+              --repo "$REPO" \
+              --base main \
+              --head "$BRANCH" \
+              --title "Merge ${BRANCH} into main" \
+              --body "$BODY"
+          fi
