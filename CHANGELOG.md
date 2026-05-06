@@ -4,7 +4,10 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
-_Nothing yet. Open a feature branch off `main` and add entries here as you go._
+### Changed
+
+- **Install command moved to GitHub release assets.** The bootstrap URL is now `https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1` (was `raw.githubusercontent.com/.../main/install.ps1`). `releases/latest` always redirects to the most recent stable release and skips `preview/*` prereleases, so new installs are decoupled from `main`'s state — no more "install fails because `main` is between releases." `install.ps1`, `cwc.ps1`, `docker-compose.yml`, and `project-overlay.example.yml` are now uploaded as release assets by the build workflow. **This is a breaking change** for anyone who scripted the old `raw.githubusercontent.com` URL; update bookmarks. Branch-ref installs (`-Ref main`, `-Ref release/x.y.z`) still work via the raw URL fallback for development.
+- **`install.ps1` default `-Ref` changed from `main` to `latest`.** With `latest`, peer files are fetched from the same `releases/latest/download/` redirect. Tags (`-Ref v1.2.3`) pull from that release's assets. Branch refs continue to resolve through `raw.githubusercontent.com`.
 
 ## [0.1.0-alpha] - 2026-05-06
 

@@ -89,7 +89,7 @@ EOF
 ## Quickstart
 
 \`\`\`powershell
-irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 cd path\\to\\project
 cwc
 \`\`\`

@@ -7,16 +7,18 @@ Every command and flag supported by `cwc` and the installer, with a short descri
 ### `install.ps1` (one-shot installer)
 
 ```powershell
-irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 ```
 
 Downloads `cwc.ps1`, `docker-compose.yml`, and the overlay example into `%USERPROFILE%\.cwc\`, then adds a `cwc` alias to your PowerShell `$PROFILE`. Idempotent — re-running updates files in place.
+
+The install URL is stable across releases — `releases/latest/download/<asset>` always redirects to the most recent stable GitHub release (preview/* releases are flagged as prereleases and skipped). Older versions used a `raw.githubusercontent.com/.../main/...` URL that pulled from the `main` branch directly; that's no longer required.
 
 **Flags:**
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-Ref <branch\|tag>` | `main` | Install from a specific branch / tag / sha (e.g. `v1.2.3`). |
+| `-Ref <ref>` | `latest` | What to install. `latest` = most-recent stable release. A tag like `v1.2.3` = that exact release. A branch ref like `main` or `release/0.1.0` = raw files from that branch (dev / pre-release validation). |
 | `-InstallDir <path>` | `%USERPROFILE%\.cwc` | Where to drop the launcher and config files. |
 | `-LocalSource <path>` | (none) | Copy files from a local repo path instead of downloading from GitHub. Useful for development. |
 | `-NoProfileEdit` | (off) | Skip writing the `cwc` alias to `$PROFILE`. |
@@ -24,8 +26,13 @@ Downloads `cwc.ps1`, `docker-compose.yml`, and the overlay example into `%USERPR
 | `-Test` | (off) | Run end-to-end in an isolated sandbox: redirects `USERPROFILE` to a temp dir, defaults `LocalSource` to the script's own directory, leaves `$PROFILE` alone, and cleans everything up on exit. Walk the wizard, see your config.json dumped at the end, no permanent changes. |
 
 ```powershell
-# Pin to a tag
+# Pin to a specific release tag. Install.ps1 is also published as a release
+# asset, so the bootstrap URL and -Ref both point at the same tag.
 $args = @('-Ref','v1.2.3')
+irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1 | iex
+
+# Install from a branch (dev / pre-release validation)
+$args = @('-Ref','main')
 irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
 
 # Test the installer locally without touching your real config

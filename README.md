@@ -23,7 +23,7 @@ Full security model + threat analysis: [`docs/security.md`](./docs/security.md).
 ## Quickstart
 
 ```powershell
-irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 ```
 
 The installer is interactive: a security primer (what an agent can do, what cwc sandboxes by default), then a six-question wizard covering LAN subnets, host services, custom FQDN → IP mappings, extra folder mounts, and whether to enable `cwc harden`. Skip the wizard with `-SkipFirewallSetup` and configure later via `cwc firewall ...` / `cwc harden ...`.

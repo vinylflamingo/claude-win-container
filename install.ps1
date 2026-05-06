@@ -2,7 +2,7 @@
 #
 # Run from any PowerShell prompt:
 #
-#   irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+#   irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 #
 # What it does:
 #   1. Shows a security primer about why the sandbox restricts network access
@@ -22,10 +22,15 @@
 #                         LocalSource defaults to the script's own dir, and
 #                         everything is cleaned up on exit. Walk the wizard,
 #                         see your config.json, no permanent changes.
+#
+# -Ref accepts:
+#   latest                  most-recent stable GitHub release (default; skips preview/*)
+#   v1.2.3                  exact release tag
+#   main / release/x.y.z    branch ref (raw.githubusercontent.com fallback for dev)
 
 [CmdletBinding()]
 param(
-    [string]$Ref                = 'main',
+    [string]$Ref                = 'latest',
     [string]$InstallDir         = (Join-Path $env:USERPROFILE '.cwc'),
     [string]$LocalSource        = '',
     [switch]$NoProfileEdit,
@@ -34,7 +39,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$base = "https://raw.githubusercontent.com/vinylflamingo/claude-win-container/$Ref"
+
+# Resolve a download URL for one file. Three modes, chosen by the shape of $Ref:
+#   - 'latest'       -> GitHub release "latest" redirect (skips prereleases). Asset
+#                       names are flat (no directories), so we use $AssetName.
+#   - tag like v*    -> specific GitHub release. Same flat asset namespace.
+#   - branch ref     -> raw.githubusercontent.com fallback. Preserves the in-repo
+#                       path via $RelPath -- useful for testing an unreleased branch.
+function Get-CwcDownloadUrl {
+    param(
+        [string]$Ref,
+        [string]$RelPath,
+        [string]$AssetName
+    )
+    if ($Ref -eq 'latest') {
+        return "https://github.com/vinylflamingo/claude-win-container/releases/latest/download/$AssetName"
+    } elseif ($Ref -match '^v\d+\.\d+\.\d+') {
+        return "https://github.com/vinylflamingo/claude-win-container/releases/download/$Ref/$AssetName"
+    } else {
+        return "https://raw.githubusercontent.com/vinylflamingo/claude-win-container/$Ref/$RelPath"
+    }
+}
 
 # Test-mode setup: redirect USERPROFILE to a fresh sandbox dir and override defaults
 # so nothing in the user's real home is touched. Cleaned up in the finally block.
@@ -157,15 +182,19 @@ Write-Section "Installing launcher into $InstallDir"
 
 if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
 
+# Per-file: rel = path inside the repo (used by branch-ref fallback and -LocalSource);
+#           asset = flat filename as uploaded to the GitHub release.
 $files = @(
-    @{ rel = 'cwc.ps1';                              dest = 'cwc.ps1' }
-    @{ rel = 'docker-compose.yml';                   dest = 'docker-compose.yml' }
-    @{ rel = 'overlays/project-overlay.example.yml'; dest = 'project-overlay.example.yml' }
+    @{ rel = 'cwc.ps1';                              asset = 'cwc.ps1';                     dest = 'cwc.ps1' }
+    @{ rel = 'docker-compose.yml';                   asset = 'docker-compose.yml';          dest = 'docker-compose.yml' }
+    @{ rel = 'overlays/project-overlay.example.yml'; asset = 'project-overlay.example.yml'; dest = 'project-overlay.example.yml' }
 )
 
 if ($LocalSource) {
     $LocalSource = (Resolve-Path -LiteralPath $LocalSource).Path
     Write-Host "  (copying from local source: $LocalSource)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  (downloading from $Ref)" -ForegroundColor DarkGray
 }
 foreach ($f in $files) {
     $dest = Join-Path $InstallDir $f.dest
@@ -177,7 +206,8 @@ foreach ($f in $files) {
         }
         Copy-Item -LiteralPath $src -Destination $dest -Force
     } else {
-        Invoke-WebRequest -Uri "$base/$($f.rel)" -OutFile $dest -UseBasicParsing
+        $url = Get-CwcDownloadUrl -Ref $Ref -RelPath $f.rel -AssetName $f.asset
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
     }
 }
 

@@ -299,6 +299,13 @@ jobs:
       # softprops/action-gh-release creates the tag at HEAD and the release.
       # `prerelease: true` for preview branches → GitHub shows a yellow badge
       # and excludes it from "Latest release" on the repo page.
+      #
+      # `files:` attaches the launcher files as release assets so users can
+      # install via the stable URL `releases/latest/download/install.ps1` instead
+      # of pinning a branch. GitHub's `releases/latest` redirect skips
+      # prerelease entries, so preview/* releases publish assets but don't
+      # become the "latest" install target. Asset names are flat (no dirs);
+      # `overlays/project-overlay.example.yml` lands as `project-overlay.example.yml`.
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -307,6 +314,11 @@ jobs:
           body_path: release-body.md
           target_commitish: ${{ github.sha }}
           prerelease: ${{ needs.classify.outputs.branch_kind == 'preview' }}
+          files: |
+            install.ps1
+            cwc.ps1
+            docker-compose.yml
+            overlays/project-overlay.example.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
