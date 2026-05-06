@@ -1,4 +1,4 @@
-# tests/run.ps1 — Layer 1 isolation tests.
+# tests/run.ps1 -- Layer 1 isolation tests.
 #
 # What it does:
 #   1. Snapshots your real ~/.cwc/config.json so tests can mutate it freely
@@ -21,13 +21,14 @@
 param(
     [string]$Image    = '',
     [string]$Filter   = '',
-    [switch]$NoCleanup
+    [switch]$NoCleanup,
+    [switch]$Build
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# Resolve cwc — the launcher next to this repo, not whatever's installed for the user.
+# Resolve cwc -- the launcher next to this repo, not whatever's installed for the user.
 $repoRoot = Split-Path -Parent $here
 $cwcLauncher = Join-Path $repoRoot 'cwc.ps1'
 if (-not (Test-Path $cwcLauncher)) {
@@ -39,6 +40,23 @@ Set-Alias cwc $cwcLauncher -Scope Script
 # Image override
 $savedImage = $env:CWC_IMAGE
 if ($Image) { $env:CWC_IMAGE = $Image }
+
+# Optional: rebuild the image before running. Strongly recommended when iterating
+# on entrypoint.ps1 or Dockerfile changes -- the default image is the published one
+# from Docker Hub, which won't have your local changes. Without -Build, container-
+# tier tests (network, settings, harden) test the *published* image's behaviour,
+# not your working tree.
+if ($Build) {
+    Write-Host "Building image from local Dockerfile..." -ForegroundColor Cyan
+    $cwcLocal = if ($env:CWC_IMAGE) { $env:CWC_IMAGE } else { 'fcostoya/claude-win-container:dev' }
+    $env:CWC_IMAGE = $cwcLocal
+    & docker compose -f (Join-Path $repoRoot 'docker-compose.yml') build claude-code
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Build failed; aborting." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Built $cwcLocal" -ForegroundColor Green
+}
 
 # Snapshot real user config
 $realCfg  = Join-Path $env:USERPROFILE '.cwc\config.json'

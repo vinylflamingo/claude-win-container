@@ -37,28 +37,40 @@ Run-TestCase -Category network -Name 'public internet still reachable under lock
     Should-Match $out 'True' -Because 'lockdown only blocks RFC1918; public IPs must stay reachable'
 }
 
-Run-TestCase -Category network -Name 'host-gateway mapping written to hosts file' -Test {
-    Set-CwcConfig -LockdownLan $true -ExtraHosts @{ 'test.cwc.local' = 'host-gateway' }
+Run-TestCase -Category network -Name 'host-gateway mapping written to hosts file pointing at loopback' -Test {
+    Set-CwcConfig -LockdownLan $true -ExtraHosts @{
+        'test.cwc.local' = @{ target = 'host-gateway'; ports = @(443) }
+    }
     $out = Invoke-InContainer 'Get-Content C:\Windows\System32\drivers\etc\hosts'
     Should-Match $out 'test\.cwc\.local'
+    # Phase 4: hosts file maps fqdn -> 127.0.0.X (loopback), not directly to gateway IP.
+    Should-Match $out '127\.0\.0\.\d+\s+test\.cwc\.local'
 }
 
-Run-TestCase -Category network -Name 'host-gateway resolves to private IP and gets /32 allow' -Test {
-    Set-CwcConfig -LockdownLan $true -ExtraHosts @{ 'test.cwc.local' = 'host-gateway' }
-    # Get the IP that was written to hosts file, then check for a /32 allow-route on it.
+Run-TestCase -Category network -Name 'portproxy listener configured for listed port' -Test {
+    Set-CwcConfig -LockdownLan $true -ExtraHosts @{
+        'test.cwc.local' = @{ target = 'host-gateway'; ports = @(443) }
+    }
+    $out = Invoke-InContainer 'netsh interface portproxy show v4tov4'
+    Should-Match $out '127\.0\.0\.\d+\s+443' -Because 'portproxy must have a v4-to-v4 listener on 443 for the loopback'
+}
+
+Run-TestCase -Category network -Name 'host-gateway target /32 allow-route present' -Test {
+    Set-CwcConfig -LockdownLan $true -ExtraHosts @{
+        'test.cwc.local' = @{ target = 'host-gateway'; ports = @(443) }
+    }
+    # Resolve host-gateway IP, check the /32 allow-route. (RFC1918 only -- see security.md
+    # for why this all-ports allow exists; portproxy narrows the FQDN path but the IP
+    # itself is reachable on all ports through this route.)
     $out = Invoke-InContainer @'
-$line = Get-Content C:\Windows\System32\drivers\etc\hosts | Select-String 'test.cwc.local' | Select-Object -First 1
-if (-not $line) { Write-Output 'NO_MAPPING'; exit }
-$ip = ($line.Line -split '\s+')[0]
-Write-Output "MAPPED_IP=$ip"
-$route = Get-NetRoute -DestinationPrefix "$ip/32" -ErrorAction SilentlyContinue | Select-Object -First 1
+$gw = (Resolve-DnsName host.docker.internal -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+Write-Output "GW=$gw"
+if (-not $gw) { exit }
+$route = Get-NetRoute -DestinationPrefix "$gw/32" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($route) { Write-Output "ROUTE_NH=$($route.NextHop)" } else { Write-Output 'NO_ROUTE' }
 '@
-    Should-Match $out 'MAPPED_IP=\d+\.\d+\.\d+\.\d+'
-    # Only assert the /32 route exists if the resolved IP was in a private range
-    # (host.docker.internal usually resolves to 192.168.x — pinhole expected there).
-    if ($out -match 'MAPPED_IP=(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)') {
-        Should-Match $out 'ROUTE_NH=' -Because 'host-gateway IP in RFC1918 must get a /32 allow-route'
+    if ($out -match 'GW=(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)') {
+        Should-Match $out 'ROUTE_NH=' -Because 'host-gateway IP in RFC1918 must get a /32 allow-route for portproxy to function'
         Should-NotMatch $out 'ROUTE_NH=0\.0\.0\.0' -Because 'the /32 must point at the gateway, not be a blackhole'
     }
 }

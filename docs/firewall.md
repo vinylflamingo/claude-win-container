@@ -46,9 +46,9 @@ When something is re-allowed, the startup banner shows it:
 
 When the lockdown is disabled, no banner is printed at all.
 
-## Per-session / per-project overrides
+## Per-session overrides
 
-If you don't want to touch the persistent config, set the env vars directly. They take precedence for that session only:
+If you don't want to touch the persistent config, set the env vars in your shell. They take precedence for that session only:
 
 ```powershell
 # Just for this shell session
@@ -57,44 +57,64 @@ $env:CWC_ALLOW_NETS = '192.168.50.0/24,10.5.0.0/16'
 cwc
 ```
 
-```ini
-# Or per-project, in .env (the launcher auto-forwards CWC_* keys)
-CWC_LOCKDOWN_LAN=0
-CWC_ALLOW_NETS=192.168.50.0/24
-```
+`CWC_*` keys are deliberately **NOT** read from the project's `.env` any more. They control sandbox behaviour, and the agent has RW on the workspace — letting `.env` drive them would let the agent silently disable the lockdown on the next launch. Persistent settings go through `cwc firewall ...` (which writes `~/.cwc/config.json`); one-shot overrides go through shell env. See [`security.md`](./security.md) for the rationale.
 
-Precedence: project `.env` / shell env wins → falls back to `cwc firewall`-managed user config → falls back to defaults (lockdown on, no extra allow-list).
+Precedence: shell env wins → falls back to `cwc firewall`-managed user config → falls back to defaults.
 
 ## Reaching services on the Docker host
 
-The Docker host is reachable at the container's gateway (in the container's own subnet — not blocked). Use the standard `extra_hosts: host-gateway` pattern in a `claude-sandbox.overlay.yml`:
+Use `cwc firewall host-add`. It maps an FQDN inside the container to a per-FQDN loopback IP and sets up `netsh portproxy` to forward listed TCP ports to the Docker host's vNIC.
 
-```yaml
-services:
-  claude-code:
-    extra_hosts:
-      - "cm.ion.localhost:host-gateway"
-      - "internal-api.local:host-gateway"
+```powershell
+cwc firewall host-add traefik.local                       # default ports: 443,80
+cwc firewall host-add traefik.local host-gateway 443      # 443 only
+cwc firewall host-add db.local 192.168.1.5 5432           # explicit IP, port 5432
 ```
 
-This adds entries to the container's `hosts` file pointing those names at the Docker host's vNIC. If Traefik (or any proxy) listens on the host at `127.0.0.1:443`, the container reaches it via these names exactly like a browser on the host would.
+Inside the container, `traefik.local:443` is reachable; `traefik.local:8080` is not (no portproxy listener on that port). The denylist (`cwc firewall denylist list`) refuses host-add for FQDNs that touch Anthropic's auth channels.
 
-You don't need to add `host-gateway` to the firewall allow-list — it's already in the container's own subnet.
+**Caveat:** the underlying `host-gateway` IP is necessarily reachable on all ports through a `/32` allow-route (Windows routing has no per-port granularity). If the agent discovers the gateway IP (`Resolve-DnsName host.docker.internal`) and connects directly, it bypasses the FQDN-port narrowing. Closing this needs host-side enforcement — see [`security.md`](./security.md).
 
-> The container's own `127.0.0.1` is **the container's** loopback, not the host's. To reach the host, always go through `host-gateway` (typically via `extra_hosts`).
+> The container's own `127.0.0.1` is **the container's** loopback, not the host's. The per-FQDN loopbacks (`127.0.0.2`, `127.0.0.3`, …) are also container-local; portproxy is what bridges them to the actual host gateway.
+
+## Denylist for `host-add`
+
+`cwc firewall host-add` refuses any FQDN that matches the denylist. Defaults cover Anthropic's auth-bearing channels — preventing the agent (or a careless `.env`) from redirecting `api.anthropic.com` via hosts-file injection and exfiltrating your OAuth token / API key on the next session.
+
+Default entries (wildcard `*.` + bare-domain forms):
+
+- `*.anthropic.com`, `anthropic.com`
+- `*.claude.ai`, `claude.ai`
+- `*.claude.com`, `claude.com`
+- `*.anthropic.ai`, `anthropic.ai`
+
+Manage via:
+
+```powershell
+cwc firewall denylist list                          # show defaults + customs (tagged)
+cwc firewall denylist add internal.example.com     # extend the list
+cwc firewall denylist remove *.example.com         # remove (prompts if it's a default)
+cwc firewall denylist reset                        # clear customs, restore defaults
+```
+
+The denylist is enforced at **two layers** as defense-in-depth:
+
+1. `cwc firewall host-add` checks at config-write time, refusing to persist a denylisted entry.
+2. The container entrypoint checks again at hosts-file-write time, skipping any entry that matches — useful if `~/.cwc/config.json` was hand-edited or if `CWC_EXTRA_HOSTS` was set in the shell directly.
+
+To add an FQDN to your own denylist that's not Anthropic-related (corporate auth, banking, anything you don't want the agent to be able to redirect), use `cwc firewall denylist add` and it'll be enforced the same way.
+
+The denylist matches case-insensitively. `*.foo.com` matches `bar.foo.com` and `foo.com` but not `baz.bar.foo.com.evil.com` (suffix match against the *whole* domain after the leading `*.`).
 
 ## Limitations
 
 This is "speed-bump" defense, not isolation:
 
-- Code running as Administrator inside the container can `Remove-NetRoute` the blackholes and re-enable LAN access. A determined attacker isn't stopped.
+- Code running as Administrator inside the container can `Remove-NetRoute` the blackholes and re-enable LAN access. `cwc harden enable` adds an in-container watchdog that re-applies them every 2s, raising the bar but not closing it.
 - The lockdown only restricts **outbound** traffic to private ranges. It doesn't filter by port or protocol — anything to a public IP, including SMB/SSH/RDP to public addresses, is allowed.
-- Public IPs that happen to host hostile content aren't filtered. If you need per-FQDN egress controls, see the proxy option below.
+- Public IPs that happen to host hostile content aren't filtered. If you need per-FQDN egress controls, an HTTPS-egress proxy is the right answer (not built into v1).
 
-If you need real isolation:
-
-- **Host-side firewall on the Hyper-V vSwitch** — drop packets from the container's IP range to RFC1918 destinations at the host level. Survives in-container tampering.
-- **Outbound HTTPS proxy** (mitmproxy / squid on the host) — per-FQDN allowlist, TLS-aware. Forces all egress through a host-controlled choke point.
+For real isolation, see [`security.md`](./security.md) — host-side enforcement is documented as future work; the practical alternatives today are an HTTPS-egress proxy on the host or a separate isolated VM.
 
 ## Verifying
 
