@@ -74,9 +74,17 @@ fi
 | \`${IMAGE_NAME}:${VERSION}-ltsc2022\` | ltsc2022 | explicit |
 EOF
 
-  # Only stable releases publish `latest` aliases. Preview/* runs build the
-  # version-tagged images but skip `latest` to avoid claiming stable status.
-  if [ "${PREVIEW_BANNER:-}" != "1" ]; then
+  # Stable releases publish `:latest` aliases. Preview runs publish `:preview`
+  # aliases instead -- both are rolling pointers to the most recent build in
+  # their respective channels. The SHA-pinned rows above stay so testers can
+  # reproduce a specific build.
+  if [ "${PREVIEW_BANNER:-}" = "1" ]; then
+    cat <<EOF
+| \`${IMAGE_NAME}:preview\` | ltsc2019 | rolling -- overwritten on each preview push |
+| \`${IMAGE_NAME}:preview-ltsc2019\` | ltsc2019 | rolling |
+| \`${IMAGE_NAME}:preview-ltsc2022\` | ltsc2022 | rolling |
+EOF
+  else
     cat <<EOF
 | \`${IMAGE_NAME}:latest\` | ltsc2019 | rolling |
 | \`${IMAGE_NAME}:latest-ltsc2019\` | ltsc2019 | rolling |
@@ -84,7 +92,35 @@ EOF
 EOF
   fi
 
-  cat <<EOF
+  # Quickstart differs by channel:
+  #   - Stable: standard `irm | iex` against the /latest/ redirect (default
+  #     -Ref = 'latest' inside install.ps1, so no args needed).
+  #   - Preview: must pass -Ref preview to install.ps1, which means using the
+  #     scriptblock form -- `irm | iex` does NOT bind args from $args/$PSBoundParameters
+  #     in the parent scope into the iex'd script's param() block. install.ps1
+  #     records the channel in ~/.cwc/config.json so cwc defaults to :preview
+  #     images afterwards (no need to set CWC_IMAGE per shell).
+  if [ "${PREVIEW_BANNER:-}" = "1" ]; then
+    cat <<EOF
+
+## Quickstart
+
+\`\`\`powershell
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1))) -Ref preview
+cd path\\to\\project
+cwc
+\`\`\`
+
+After install, \`cwc\` defaults to the rolling \`:preview\` image. To pin this exact build instead:
+
+\`\`\`powershell
+\$env:CWC_IMAGE = '${IMAGE_NAME}:${VERSION}'
+\`\`\`
+
+To go back to the latest stable, re-run the standard install command (\`irm .../releases/latest/download/install.ps1 | iex\`); it rewrites the channel field.
+EOF
+  else
+    cat <<EOF
 
 ## Quickstart
 
@@ -100,6 +136,7 @@ cwc
 \$env:CWC_IMAGE = '${IMAGE_NAME}:${VERSION}'
 \`\`\`
 EOF
+  fi
 } > release-body.md
 
 echo "Wrote $(wc -l < release-body.md) lines to release-body.md"

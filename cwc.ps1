@@ -17,7 +17,9 @@
 #
 # Image selection:
 #   $env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1'   # pin a version
-#   default = 'fcostoya/claude-win-container:latest'
+#   default tag follows the install channel recorded in ~/.cwc/config.json:
+#     channel=stable  -> 'fcostoya/claude-win-container:latest'
+#     channel=preview -> 'fcostoya/claude-win-container:preview'
 #
 # State layout:
 #   %USERPROFILE%\.claude-win-container\
@@ -109,7 +111,7 @@ function Show-CwcUsage {
     Write-Host "  --                       Everything after this is forwarded to ``claude`` verbatim."
     Write-Host ""
     Write-Host "ENVIRONMENT" -ForegroundColor Yellow
-    Write-Host "  CWC_IMAGE                Pin a specific image (default: fcostoya/claude-win-container:latest)."
+    Write-Host "  CWC_IMAGE                Pin a specific image (default depends on install channel: :latest or :preview)."
     Write-Host "  CWC_LOCKDOWN_LAN=0       Disable the LAN-egress lockdown."
     Write-Host "  CWC_ALLOW_NETS=cidr,...  Re-allow specific subnets (e.g. ``192.168.50.0/24``)."
     Write-Host ""
@@ -404,6 +406,7 @@ function Read-CwcGlobalConfig {
                 lockdown_lan   = $true
                 harden_enabled = $false
             }
+            channel       = 'stable'
         }
     }
     $raw  = Get-Content -LiteralPath $cwcConfigPath -Raw
@@ -421,20 +424,29 @@ function Read-CwcGlobalConfig {
         if ($null -ne $json.defaults.lockdown_lan)   { $defaults.lockdown_lan   = [bool]$json.defaults.lockdown_lan }
         if ($null -ne $json.defaults.harden_enabled) { $defaults.harden_enabled = [bool]$json.defaults.harden_enabled }
     }
+    # `channel` is install-managed: install.ps1 writes 'preview' or 'stable' so the
+    # launcher knows which Docker tag to default to. Anything unrecognized -> 'stable'.
+    $channel = 'stable'
+    if ($json.PSObject.Properties.Name -contains 'channel' -and $json.channel -eq 'preview') {
+        $channel = 'preview'
+    }
     return [pscustomobject]@{
         host_denylist = $denylist
         defaults      = $defaults
+        channel       = $channel
     }
 }
 
 function Write-CwcGlobalConfig($cfg) {
     if (-not (Test-Path $cwcConfigDir)) { New-Item -ItemType Directory -Force -Path $cwcConfigDir | Out-Null }
+    $channel = if ($cfg.channel -eq 'preview') { 'preview' } else { 'stable' }
     @{
         host_denylist = @($cfg.host_denylist)
         defaults      = @{
             lockdown_lan   = [bool]$cfg.defaults.lockdown_lan
             harden_enabled = [bool]$cfg.defaults.harden_enabled
         }
+        channel       = $channel
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cwcConfigPath
 }
 
@@ -1931,8 +1943,15 @@ foreach ($k in $forwardKeys) {
 }
 
 # 5. Acquire image: pull (default) or build (when -Build or no Dockerfile beside us)
-# Image reference can be overridden via CWC_IMAGE; default points at the public Docker Hub repo.
-$cwcImage = if ($env:CWC_IMAGE) { $env:CWC_IMAGE } else { 'fcostoya/claude-win-container:latest' }
+# Image reference can be overridden via CWC_IMAGE; otherwise the default tag follows
+# the install channel recorded in ~/.cwc/config.json (preview channel -> :preview;
+# anything else -> :latest). install.ps1 sets this based on -Ref.
+if ($env:CWC_IMAGE) {
+    $cwcImage = $env:CWC_IMAGE
+} else {
+    $defaultTag = if ((Read-CwcGlobalConfig).channel -eq 'preview') { 'preview' } else { 'latest' }
+    $cwcImage   = "fcostoya/claude-win-container:$defaultTag"
+}
 $env:CWC_IMAGE = $cwcImage   # surface to compose interpolation
 
 docker image inspect $cwcImage *> $null

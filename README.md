@@ -147,11 +147,10 @@ The SHA-pinned tags stay around indefinitely on Docker Hub — useful for reprod
 **Full install from the latest preview** (pulls the preview's `install.ps1`, `cwc.ps1`, `docker-compose.yml` instead of the latest stable's):
 
 ```powershell
-$args = @('-Ref','preview')
-irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1))) -Ref preview
 ```
 
-This overwrites `~/.cwc/` with the preview's launcher files. To go back to the latest stable, re-run the normal install command — it pulls from `releases/latest/download/`, which always resolves to the most recent **non-prerelease** release; pre-releases are skipped automatically.
+`irm | iex` can't pass parameters to the downloaded script's `param()` block, so the install needs the `& ([scriptblock]::Create(...))` form to forward `-Ref preview` correctly. The installer records `channel: preview` in `~/.cwc/config.json`, and from then on `cwc` pulls `:preview` images by default until you reinstall from the stable channel. To go back, re-run the normal install command — it pulls from `releases/latest/download/`, which always resolves to the most recent **non-prerelease** release.
 
 When the version under preview eventually ships as a stable release (same version number, e.g. `v0.1.1`), it gets a separate stable release entry and Docker tags (`:0.1.1`, `:latest`). The `preview` release stays around but stops being relevant for that version; the next preview push (for a future version) overwrites it.
 

@@ -192,10 +192,12 @@ jobs:
       - name: Run host-only tests
         shell: pwsh
         run: |
-          # Host-only test subset — exercises cwc.ps1 directly, no Docker.
-          # Container-side tests (network, settings-merge, harden) require the
-          # built image and are not in CI; run them locally via .\tests\run.ps1 -Build.
-          .\tests\run.ps1 -Filter 'denylist|trust'
+          # Host-only test subset -- exercises cwc.ps1 directly, no Docker.
+          # Mirrors the local "fast suite" documented in CLAUDE.md (~2s, 29 tests).
+          # Container-side tests (network, settings-merge, harden, filesystem,
+          # auth) require the built image and are not in CI; run them locally
+          # via .\tests\run.ps1 -Build when iterating on entrypoint.ps1.
+          .\tests\run.ps1 -Filter 'dev|denylist|trust|project-isolation|setup'
 
   build:
     name: Build (${{ matrix.base.tag }})

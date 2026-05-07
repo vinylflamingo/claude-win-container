@@ -27,16 +27,14 @@ The install URL is stable across releases — `releases/latest/download/<asset>`
 ```powershell
 # Pin to a specific stable release tag. Install.ps1 is also published as a
 # release asset, so the bootstrap URL and -Ref both point at the same tag.
-$args = @('-Ref','v1.2.3')
-irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1 | iex
+# `irm | iex` can't pass parameters, so use the scriptblock form to forward -Ref:
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1))) -Ref v1.2.3
 
 # Install the latest preview build (moving GitHub release tagged `preview`).
-$args = @('-Ref','preview')
-irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1))) -Ref preview
 
 # Install from a branch (dev / pre-release validation -- raw.githubusercontent.com)
-$args = @('-Ref','main')
-irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1))) -Ref main
 
 # Test the installer locally without touching your real config
 .\install.ps1 -Test
@@ -52,7 +50,7 @@ irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/in
 cwc
 ```
 
-Runs `claude` inside the container against the current directory. First run pulls the image (`fcostoya/claude-win-container:latest`) from Docker Hub if it isn't local. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
+Runs `claude` inside the container against the current directory. First run pulls the image from Docker Hub if it isn't local. The default tag follows the install channel recorded in `~/.cwc/config.json` (`channel: stable` → `:latest`; `channel: preview` → `:preview`); set `$env:CWC_IMAGE` to override. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
 
 If the current project has no config (`~/.cwc/projects/<slug>/config.json`), `cwc` auto-triggers `cwc setup` inline before launching. Non-interactive sessions fail closed with a "run `cwc setup` first" message — the wizard requires a real terminal.
 
@@ -426,7 +424,7 @@ All read by the launcher and/or the entrypoint. Setting them in your shell or yo
 
 | Variable | Description |
 | --- | --- |
-| `CWC_IMAGE` | Pin a specific image. Default: `fcostoya/claude-win-container:latest`. |
+| `CWC_IMAGE` | Pin a specific image. Default: `fcostoya/claude-win-container:latest` for stable installs, `:preview` for preview installs (driven by the `channel` field in `~/.cwc/config.json`, written by `install.ps1`). |
 | `CWC_LOCKDOWN_LAN` | `1` (default) enables the LAN lockdown; `0` disables it. |
 | `CWC_ALLOW_NETS` | Comma-separated CIDRs to re-allow (e.g. `192.168.50.0/24,10.5.0.0/16`). Merged with the user-wide allow-list. |
 | `CWC_EXTRA_HOSTS` | Pipe-separated `fqdn|target|port,port` entries joined by `;` (e.g. `cm.local|host-gateway|443,80;db|10.5.1.20|5432`). Set automatically by `cwc firewall host-add`. |

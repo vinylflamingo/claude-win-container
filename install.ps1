@@ -197,6 +197,26 @@ foreach ($f in $files) {
 
 $launcher = Join-Path $InstallDir 'cwc.ps1'
 
+# 2b. Record install channel in ~/.cwc/config.json.
+# cwc.ps1 reads this to pick the default Docker image tag (:preview vs :latest)
+# without needing CWC_IMAGE to be set on every shell. Reinstalling from the other
+# channel rewrites this field; pinning via CWC_IMAGE always takes precedence.
+$channel = if ($Ref -eq 'preview') { 'preview' } else { 'stable' }
+$globalConfigPath = Join-Path $InstallDir 'config.json'
+$existing = $null
+if (Test-Path -LiteralPath $globalConfigPath) {
+    try { $existing = Get-Content -LiteralPath $globalConfigPath -Raw | ConvertFrom-Json } catch { $existing = $null }
+}
+# Preserve host_denylist + defaults if they're already set; only the channel field
+# is install-managed. The launcher's Read-CwcGlobalConfig fills in sensible defaults
+# for everything else, so we don't need to construct a full config here.
+$out = [ordered]@{}
+if ($existing -and $existing.host_denylist) { $out.host_denylist = @($existing.host_denylist) }
+if ($existing -and $existing.defaults)      { $out.defaults      = $existing.defaults }
+$out.channel = $channel
+$out | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $globalConfigPath
+Write-Host "  - recorded channel = $channel in config.json" -ForegroundColor DarkGray
+
 # 3. PowerShell profile alias
 if (-not $NoProfileEdit) {
     if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Force -Path $PROFILE | Out-Null }
