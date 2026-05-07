@@ -26,16 +26,19 @@ Full security model + threat analysis: [`docs/security.md`](./docs/security.md).
 irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 ```
 
-The installer is interactive: a security primer (what an agent can do, what cwc sandboxes by default), then a six-question wizard covering LAN subnets, host services, custom FQDN → IP mappings, extra folder mounts, and whether to enable `cwc harden`. Skip the wizard with `-SkipFirewallSetup` and configure later via `cwc firewall ...` / `cwc harden ...`.
+The installer is brief: a security primer (what an agent can do, what cwc sandboxes by default), then it drops the launcher into `%USERPROFILE%\.cwc\` and adds a `cwc` alias to your `$PROFILE`. Idempotent — safe to re-run.
 
-Then open a new PowerShell, `cd` into any project, and run `cwc`. First run pulls the image (~6 GB) from Docker Hub.
+Per-project sandbox configuration happens **inside each project** the first time you run `cwc` there:
 
 ```powershell
 cd C:\Users\you\Projects\my-app
-cwc                       # first run: pulls image, then launches `claude`
+cwc                       # first run: triggers `cwc setup` automatically
+                          # then pulls image (~6 GB) and launches `claude`
 ```
 
-The installer drops the launcher into `%USERPROFILE%\.cwc\` and adds a `cwc` alias to your `$PROFILE`. Idempotent — safe to re-run.
+The first-run setup is a six-question wizard scoped to that project: LAN subnets, host-machine services + ports (always registers `host` so the agent reaches your dev server as `http://host:3000`), custom FQDN → IP mappings, folder mounts, and whether to enable `cwc harden`. Each project gets its own config at `%USERPROFILE%\.cwc\projects\<slug>\config.json` — host-side (the agent can't see or modify it). Re-run `cwc setup` anytime to reconfigure.
+
+Subsequent runs of `cwc` in the same project skip the wizard and launch directly.
 
 ## Pre-requisites
 
@@ -111,11 +114,52 @@ Full layout + how the auth bind narrowing works: [`docs/security.md`](./docs/sec
 ## Pin a specific version
 
 ```powershell
-$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.0-alpha'
+$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1'
 cwc
 ```
 
 Or set it permanently in `$PROFILE` alongside the alias.
+
+## Trying a preview release
+
+`preview/*` branches publish version-tagged Docker images and a GitHub *pre-release* — useful for trying changes before they ship as `:latest`. Preview tags never become `:latest`; you opt in by name.
+
+**See what's available**: <https://github.com/vinylflamingo/claude-win-container/releases> shows pre-releases with a yellow "Pre-release" badge and an explicit `v<version>-rc.N` tag.
+
+**Just the docker image** (keeps your installed `cwc.ps1` / `docker-compose.yml`):
+
+```powershell
+$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1-rc.1'
+cwc
+```
+
+Unset to go back to the stable release: `Remove-Item Env:CWC_IMAGE`.
+
+**Full install from a preview** (pulls the preview's `install.ps1`, `cwc.ps1`, `docker-compose.yml` instead of the latest stable's):
+
+```powershell
+$args = @('-Ref','v0.1.1-rc.1')
+irm https://github.com/vinylflamingo/claude-win-container/releases/download/v0.1.1-rc.1/install.ps1 | iex
+```
+
+This overwrites `~/.cwc/` with the preview's launcher files. To go back to stable, re-run the normal install command (it pulls from `releases/latest/download/` which always points to the most recent **stable** release; preview releases are skipped).
+
+## Working on cwc itself: `cwc dev`
+
+If you've cloned the repo to make changes, `cwc dev` is the developer loop. Each invocation runs against a local `:dev` image (built from the Dockerfile next to `cwc.ps1`) for that one launch — leave the session and you're back in normal mode.
+
+```powershell
+cwc dev                       # launch claude in :dev container; builds image if missing
+cwc dev powershell            # drop to a shell in the :dev container
+cwc dev build                 # build :dev now
+cwc dev rebuild               # remove :dev and build --no-cache
+cwc dev status                # show :dev image presence + flag values
+cwc dev flag list             # list dev-mode flags
+```
+
+One flag worth knowing: `cwc dev flag set live_entrypoint_mount on` bind-mounts the clone's `entrypoint.ps1` over `C:\entrypoint.ps1` inside the container, so edits take effect on the next `cwc dev` with no rebuild — turns ~5 minute build cycles into seconds when iterating on the entrypoint.
+
+`cwc dev` requires running from a clone (Dockerfile must sit next to `cwc.ps1`); it errors out otherwise. Full guide in [`docs/development.md`](./docs/development.md).
 
 ## Building from source
 
@@ -150,7 +194,7 @@ That's expected — `.env` / `.mcp.json` / overlays live in your repo. The trust
 
 ## Releases
 
-**Current version: `0.1.0-alpha`.** The project is in alpha — APIs (CLI shape, config schema, image tag layout) may still change before `0.1.0` proper.
+**Current version: `0.1.1`.** Still 0.x — APIs (CLI shape, config schema, image tag layout) may still change before 1.0. Don't pin production tooling to specific 0.x tags expecting compatibility across them.
 
 Releases are branch-driven. Pushing a `release/<semver>` branch (e.g. `release/0.1.0`) triggers a CI run that publishes the following Docker tags:
 

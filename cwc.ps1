@@ -16,7 +16,7 @@
 #   cwc -- <args>             # pass remaining args to claude (e.g. cwc -- --resume)
 #
 # Image selection:
-#   $env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.0-alpha'   # pin a version
+#   $env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1'   # pin a version
 #   default = 'fcostoya/claude-win-container:latest'
 #
 # State layout:
@@ -57,9 +57,19 @@ function Show-CwcUsage {
     Write-Host ""
     Write-Host "COMMANDS" -ForegroundColor Yellow
     Write-Host "  (no args)                Run ``claude`` inside the container."
+    Write-Host "  setup                    First-time wizard for this project. Configures firewall,"
+    Write-Host "                           host-services, mounts, and harden for the current dir."
+    Write-Host "                           Run before the first ``cwc`` invocation in any new project."
+    Write-Host "  dev [args...]            Session-scoped dev mode. Runs against the local :dev image"
+    Write-Host "                           (built from the Dockerfile next to cwc.ps1). Each ``cwc dev``"
+    Write-Host "                           explicitly opts in -- normal ``cwc`` stays unaffected."
+    Write-Host "                             dev build / rebuild / clean   manage the :dev image"
+    Write-Host "                             dev status                    show :dev image state + flags"
+    Write-Host "                             dev flag {list|set|unset}     persistent dev flags"
+    Write-Host "                                                           (e.g. live_entrypoint_mount)"
     Write-Host "  powershell               Drop to a PowerShell prompt inside the container."
     Write-Host "  mcp <subcommand>         Shorthand for ``cwc claude mcp ...`` (e.g. ``cwc mcp list``)."
-    Write-Host "  firewall <subcommand>    Manage the LAN lockdown. Subcommands:"
+    Write-Host "  firewall <subcommand>    Per-project. Manage this project's LAN lockdown:"
     Write-Host "                             list                          show current state"
     Write-Host "                             allow <cidr>                  re-allow a subnet (e.g. 192.168.50.0/24)"
     Write-Host "                             deny <cidr>                   remove a previously allowed subnet"
@@ -69,9 +79,9 @@ function Show-CwcUsage {
     Write-Host "                                                           (target defaults to host-gateway)"
     Write-Host "                             host-remove <fqdn>            remove a mapping"
     Write-Host "                             denylist {list|add|remove|reset}"
-    Write-Host "                                                           manage FQDNs that host-add refuses"
+    Write-Host "                                                           GLOBAL -- FQDNs that host-add refuses"
     Write-Host "                                                           (defaults: anthropic.com / claude.ai etc.)"
-    Write-Host "  mount <subcommand>       Manage extra bind mounts (Obsidian vaults, design specs, runbooks)."
+    Write-Host "  mount <subcommand>       Per-project. Bind mounts (Obsidian vaults, design specs, runbooks)."
     Write-Host "                             list                          show configured mounts"
     Write-Host "                             add <name> <path> [ro|rw]     mount path at C:\docs\<name> in the"
     Write-Host "                                                           container (readonly by default)"
@@ -85,9 +95,9 @@ function Show-CwcUsage {
     Write-Host "                           on next run. Per-project state is unaffected."
     Write-Host "  auth where               Print where shared and per-project state live."
     Write-Host "  harden {enable|disable|status}"
-    Write-Host "                           Toggle the tamper-resistant in-container watchdog. Off by"
-    Write-Host "                           default; run 'cwc harden status' for what it does and the"
-    Write-Host "                           trade-offs (also docs/security.md)."
+    Write-Host "                           Per-project. Toggle the tamper-resistant in-container"
+    Write-Host "                           watchdog. Off by default; run 'cwc harden status' for what"
+    Write-Host "                           it does and the trade-offs (also docs/security.md)."
     Write-Host "  help                     Print this usage and exit (also -Help / -h)."
     Write-Host "  <anything else>          Run that command inside the container."
     Write-Host ""
@@ -120,9 +130,30 @@ if ($Help -or ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'help')) {
 }
 
 # 0b. User config (persistent CWC settings)
-# Stored at %USERPROFILE%\.cwc\config.json.
-$cwcConfigDir  = Join-Path $env:USERPROFILE '.cwc'
-$cwcConfigPath = Join-Path $cwcConfigDir 'config.json'
+# Two layers:
+#   ~/.cwc/config.json                 -- global security policy (denylist + defaults).
+#                                         Things the user should not be able to weaken
+#                                         per-project (denylist) or that act as system-wide
+#                                         defaults applied when a project doesn't override.
+#   ~/.cwc/projects/<slug>/config.json -- per-project sandbox config (firewall, mounts,
+#                                         host-services, harden, trusted-file hashes).
+#                                         Lives outside the workspace so the agent can't
+#                                         see or modify it. <slug> = Get-ProjectSlug of
+#                                         the project's absolute path -- stable across
+#                                         runs, unique per project.
+$cwcConfigDir   = Join-Path $env:USERPROFILE '.cwc'
+$cwcConfigPath  = Join-Path $cwcConfigDir 'config.json'
+$cwcProjectsDir = Join-Path $cwcConfigDir 'projects'
+
+# Dev-mode state. Session-scoped: each `cwc dev` invocation explicitly opts in;
+# leaving the session puts you back in normal mode. Flag settings (e.g.
+# live_entrypoint_mount) ARE persistent so you don't have to re-set them every
+# session -- they live at ~/.cwc/dev.json and are read at the start of each
+# dev invocation.
+$cwcDevImage      = 'fcostoya/claude-win-container:dev'
+$cwcDevConfigPath = Join-Path $cwcConfigDir 'dev.json'
+$script:cwcDevMode         = $false
+$script:cwcDevExtraMounts  = @()
 
 # Hostname / target validators. Used by both `cwc firewall host-add` (block bad input
 # at config-write time) and the entrypoint (defense in depth -- refuse bad entries
@@ -192,6 +223,23 @@ function Get-ProjectSlug([string]$path) {
     return "$base-$($hex.Substring(0,12))"
 }
 
+# Bundle the three pieces of project identity callers usually want at once.
+# Use this instead of recomputing slug/name/path independently in different code paths.
+function Get-CwcProjectMetadata([string]$projectDir) {
+    $abs = (Resolve-Path $projectDir).Path
+    return [pscustomobject]@{
+        path = $abs
+        name = Split-Path -Leaf $abs
+        slug = Get-ProjectSlug $abs
+    }
+}
+
+# Returns the absolute path to a project's config file given its slug.
+# The file may not exist -- callers should check with Test-Path.
+function Get-CwcProjectConfigPath([string]$slug) {
+    return Join-Path $cwcProjectsDir (Join-Path $slug 'config.json')
+}
+
 # Trust system. The agent has RW on the workspace, so it can edit any file there
 # -- including files we read at launcher start (compose overlay, .env forwarding,
 # .mcp.json env-key references). Each of these files can expand what flows into
@@ -212,11 +260,10 @@ function Get-FileSha256([string]$path) {
 
 # Returns a hashtable describing the trust state of all tracked files in a project.
 # Used by both the trust subcommand and the pre-launch verification.
-function Get-CwcProjectTrustState($cfg, [string]$slug, [string]$projectDir) {
-    $trustedMap = @{}
-    if ($cfg.trusted_files -and $cfg.trusted_files.ContainsKey($slug)) {
-        $trustedMap = $cfg.trusted_files[$slug]
-    }
+# $projectCfg is a per-project config (from Read-CwcProjectConfig); pass $null for
+# "no project config yet" (everything will report as untrusted).
+function Get-CwcProjectTrustState($projectCfg, [string]$projectDir) {
+    $trustedMap = if ($projectCfg -and $projectCfg.trusted_files) { $projectCfg.trusted_files } else { @{} }
     $files = @()
     $anyChanged = $false
     $anyPresent = $false
@@ -248,7 +295,6 @@ function Get-CwcProjectTrustState($cfg, [string]$slug, [string]$projectDir) {
         if ($status -in @('untrusted', 'modified', 'deleted')) { $anyChanged = $true }
     }
     return [pscustomobject]@{
-        slug        = $slug
         files       = $files
         any_changed = $anyChanged
         any_present = $anyPresent
@@ -256,9 +302,25 @@ function Get-CwcProjectTrustState($cfg, [string]$slug, [string]$projectDir) {
     }
 }
 
-function Save-CwcProjectTrust($cfg, [string]$slug, [string]$projectDir) {
-    if (-not $cfg.trusted_files) {
-        $cfg | Add-Member -MemberType NoteProperty -Name trusted_files -Value @{} -Force
+# Computes current SHA-256s for all tracked files in the project and writes them
+# into the project's config. Manages its own read-modify-write cycle so callers
+# don't have to worry about stale config state. Auto-creates a default project
+# config when the file doesn't exist yet (trust can be invoked before `cwc setup`,
+# e.g. by a script).
+function Save-CwcProjectTrust([string]$slug, [string]$projectDir) {
+    $cfg = Read-CwcProjectConfig $slug
+    if (-not $cfg) {
+        $meta = Get-CwcProjectMetadata $projectDir
+        $cfg = [pscustomobject]@{
+            project_path   = $meta.path
+            project_name   = $meta.name
+            lockdown_lan   = $true
+            harden_enabled = $false
+            allow_nets     = @()
+            extra_hosts    = @{}
+            mounts         = @{}
+            trusted_files  = @{}
+        }
     }
     $map = @{}
     foreach ($name in $script:cwcTrustedFileNames) {
@@ -268,8 +330,8 @@ function Save-CwcProjectTrust($cfg, [string]$slug, [string]$projectDir) {
             if ($hash) { $map[$name] = $hash }
         }
     }
-    $cfg.trusted_files[$slug] = $map
-    Write-CwcConfig $cfg
+    $cfg.trusted_files = $map
+    Write-CwcProjectConfig $slug $cfg
     return $map.Count
 }
 
@@ -302,33 +364,95 @@ function Test-CwcInteractive {
     return $true
 }
 
-function Read-CwcConfig {
-    if (-not (Test-Path $cwcConfigPath)) {
-        return [pscustomobject]@{
-            lockdown_lan   = $true
-            allow_nets     = @()
-            extra_hosts    = @{}
-            mounts         = @{}
-            host_denylist  = @(Get-CwcDefaultDenylist)
-            trusted_files  = @{}
-            harden_enabled = $false
+# Interactive helpers used by Invoke-CwcProjectSetup. Mirror install.ps1's helpers
+# of the same shape -- intentional duplication; install.ps1 still has its own copy
+# because it runs before cwc.ps1 is on disk.
+function Read-CwcYesNo([string]$prompt, [bool]$default = $false) {
+    $hint = if ($default) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $resp = Read-Host "$prompt $hint"
+        if (-not $resp) { return $default }
+        switch -Regex ($resp.Trim().ToLower()) {
+            '^(y|yes)$' { return $true }
+            '^(n|no)$'  { return $false }
+            default     { Write-Host "  Please answer yes or no." -ForegroundColor Yellow }
         }
     }
-    $raw = Get-Content -LiteralPath $cwcConfigPath -Raw
+}
+
+function Read-CwcNonEmpty([string]$prompt) {
+    while ($true) {
+        $resp = Read-Host $prompt
+        if ($resp -and $resp.Trim()) { return $resp.Trim() }
+        Write-Host "  Required." -ForegroundColor Yellow
+    }
+}
+
+# --- Persistent config (split global / per-project) ---------------------------
+# State is divided into:
+#   global   -- security policy at ~/.cwc/config.json: host_denylist + defaults block.
+#   project  -- everything else at ~/.cwc/projects/<slug>/config.json: lockdown_lan,
+#               harden_enabled, allow_nets, extra_hosts, mounts, trusted_files.
+# Read-CwcProjectConfig returns $null when the project has no config yet
+# (signal for the auto-setup flow to kick in).
+
+function Read-CwcGlobalConfig {
+    if (-not (Test-Path $cwcConfigPath)) {
+        return [pscustomobject]@{
+            host_denylist = @(Get-CwcDefaultDenylist)
+            defaults      = @{
+                lockdown_lan   = $true
+                harden_enabled = $false
+            }
+        }
+    }
+    $raw  = Get-Content -LiteralPath $cwcConfigPath -Raw
     $json = $raw | ConvertFrom-Json
-    # JSON objects deserialise to PSCustomObject; convert nested ones to hashtables for mutation.
-    # extra_hosts schema: each value is { target = '<host-gateway|ip>', ports = @(<int>...) }.
-    # Old schema (pre-Phase 4) used a bare string target -- we migrate inline (default ports 443,80)
-    # and emit a one-time banner when we first detect the migration.
+    $denylist = if ($null -ne $json.host_denylist) {
+        @($json.host_denylist) | Where-Object { $_ }
+    } else {
+        @(Get-CwcDefaultDenylist)
+    }
+    $defaults = @{
+        lockdown_lan   = $true
+        harden_enabled = $false
+    }
+    if ($json.defaults) {
+        if ($null -ne $json.defaults.lockdown_lan)   { $defaults.lockdown_lan   = [bool]$json.defaults.lockdown_lan }
+        if ($null -ne $json.defaults.harden_enabled) { $defaults.harden_enabled = [bool]$json.defaults.harden_enabled }
+    }
+    return [pscustomobject]@{
+        host_denylist = $denylist
+        defaults      = $defaults
+    }
+}
+
+function Write-CwcGlobalConfig($cfg) {
+    if (-not (Test-Path $cwcConfigDir)) { New-Item -ItemType Directory -Force -Path $cwcConfigDir | Out-Null }
+    @{
+        host_denylist = @($cfg.host_denylist)
+        defaults      = @{
+            lockdown_lan   = [bool]$cfg.defaults.lockdown_lan
+            harden_enabled = [bool]$cfg.defaults.harden_enabled
+        }
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cwcConfigPath
+}
+
+function Read-CwcProjectConfig([string]$slug) {
+    $path = Get-CwcProjectConfigPath $slug
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $raw  = Get-Content -LiteralPath $path -Raw
+    $json = $raw | ConvertFrom-Json
+
+    # extra_hosts: tolerate the old bare-string target format (one-line grandfather
+    # to {target, ports = 443,80}). Per-project files are written by the new code
+    # path so this only matters for hand-edited or migrated files.
     $hosts = @{}
-    $script:cwcMigratedHostPorts = $false
     if ($json.extra_hosts) {
         foreach ($p in $json.extra_hosts.PSObject.Properties) {
             $val = $p.Value
             if ($val -is [string]) {
-                # Old format: bare string target, no ports -- grandfather to 443,80.
                 $hosts[$p.Name] = @{ target = [string]$val; ports = @(443, 80) }
-                $script:cwcMigratedHostPorts = $true
             } elseif ($val) {
                 $portsRaw = if ($null -ne $val.ports) { @($val.ports) } else { @(443, 80) }
                 $hosts[$p.Name] = @{
@@ -338,6 +462,7 @@ function Read-CwcConfig {
             }
         }
     }
+
     $mounts = @{}
     if ($json.mounts) {
         foreach ($p in $json.mounts.PSObject.Properties) {
@@ -349,63 +474,775 @@ function Read-CwcConfig {
             }
         }
     }
-    $denylist = if ($null -ne $json.host_denylist) {
-        @($json.host_denylist) | Where-Object { $_ }
-    } else {
-        # Existing config without host_denylist field -- populate with defaults.
-        @(Get-CwcDefaultDenylist)
-    }
-    # Per-project file-trust hashes. JSON deserialises nested objects as PSCustomObject;
-    # convert to nested hashtables so the trust subcommand can mutate cleanly.
+
+    # trusted_files at the project level is a flat name -> sha256 map.
+    # (The old global-config schema keyed it by slug; per-project files don't
+    # need that indirection since the file itself is already slug-scoped.)
     $trustedFiles = @{}
     if ($json.trusted_files) {
         foreach ($p in $json.trusted_files.PSObject.Properties) {
-            $perProject = @{}
-            if ($p.Value) {
-                foreach ($q in $p.Value.PSObject.Properties) {
-                    $perProject[$q.Name] = [string]$q.Value
-                }
-            }
-            $trustedFiles[$p.Name] = $perProject
+            $trustedFiles[$p.Name] = [string]$p.Value
         }
     }
+
+    $allowNets = if ($json.allow_nets) { @($json.allow_nets) | Where-Object { $_ } } else { @() }
+
+    # Fall back to global defaults when project file omits a field. This lets the
+    # global config drive the "what does cwc do by default everywhere" knob without
+    # baking the value into every per-project file at write time.
+    $global = Read-CwcGlobalConfig
+
     return [pscustomobject]@{
-        lockdown_lan   = if ($null -ne $json.lockdown_lan) { [bool]$json.lockdown_lan } else { $true }
-        allow_nets     = @($json.allow_nets) | Where-Object { $_ }
+        project_path   = [string]$json.project_path
+        project_name   = [string]$json.project_name
+        lockdown_lan   = if ($null -ne $json.lockdown_lan)   { [bool]$json.lockdown_lan }   else { [bool]$global.defaults.lockdown_lan }
+        harden_enabled = if ($null -ne $json.harden_enabled) { [bool]$json.harden_enabled } else { [bool]$global.defaults.harden_enabled }
+        allow_nets     = @($allowNets)
         extra_hosts    = $hosts
         mounts         = $mounts
-        host_denylist  = $denylist
         trusted_files  = $trustedFiles
-        harden_enabled = if ($null -ne $json.harden_enabled) { [bool]$json.harden_enabled } else { $false }
     }
 }
 
-function Write-CwcConfig($cfg) {
-    if (-not (Test-Path $cwcConfigDir)) { New-Item -ItemType Directory -Force -Path $cwcConfigDir | Out-Null }
-    $trustedFiles = if ($cfg.trusted_files) { $cfg.trusted_files } else { @{} }
+function Write-CwcProjectConfig([string]$slug, $cfg) {
+    $dir = Join-Path $cwcProjectsDir $slug
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $path = Join-Path $dir 'config.json'
     @{
+        project_path   = [string]$cfg.project_path
+        project_name   = [string]$cfg.project_name
         lockdown_lan   = [bool]$cfg.lockdown_lan
+        harden_enabled = [bool]$cfg.harden_enabled
         allow_nets     = @($cfg.allow_nets)
         extra_hosts    = $cfg.extra_hosts
         mounts         = $cfg.mounts
-        host_denylist  = @($cfg.host_denylist)
-        trusted_files  = $trustedFiles
-        harden_enabled = [bool]$cfg.harden_enabled
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cwcConfigPath
+        trusted_files  = if ($cfg.trusted_files) { $cfg.trusted_files } else { @{} }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path
+}
+
+# Dev-mode helpers ------------------------------------------------------------
+# Known flags + their defaults. `cwc dev flag set/unset` validates against this
+# list. Add new flags here; the dev session block below picks up known flags by
+# name and applies them.
+$script:cwcDevFlagDefaults = @{
+    live_entrypoint_mount = $false
+}
+
+function Read-CwcDevConfig {
+    $flags = @{}
+    foreach ($k in $script:cwcDevFlagDefaults.Keys) {
+        $flags[$k] = [bool]$script:cwcDevFlagDefaults[$k]
+    }
+    if (-not (Test-Path $cwcDevConfigPath)) { return $flags }
+    $raw  = Get-Content -LiteralPath $cwcDevConfigPath -Raw
+    $json = $raw | ConvertFrom-Json
+    if ($json.flags) {
+        foreach ($p in $json.flags.PSObject.Properties) {
+            if ($script:cwcDevFlagDefaults.ContainsKey($p.Name)) {
+                $flags[$p.Name] = [bool]$p.Value
+            }
+        }
+    }
+    return $flags
+}
+
+function Write-CwcDevConfig($flags) {
+    if (-not (Test-Path $cwcConfigDir)) { New-Item -ItemType Directory -Force -Path $cwcConfigDir | Out-Null }
+    @{ flags = $flags } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $cwcDevConfigPath
+}
+
+# True when cwc.ps1 is running from a git clone of this repo (Dockerfile + docker-
+# compose.yml next to it). Required for `cwc dev` -- the published install drops
+# only cwc.ps1 + docker-compose.yml + project-overlay; you can't build :dev without
+# the Dockerfile.
+function Test-CwcInClone {
+    return (Test-Path (Join-Path $scriptRoot 'Dockerfile')) -and `
+           (Test-Path (Join-Path $scriptRoot 'docker-compose.yml'))
+}
+
+# Image-tag classification + freshness helpers ---------------------------------
+# Used by the launch banner. Pure tag parsing here; the GitHub-API "is this the
+# latest stable?" lookup is a separate function with its own cache file.
+
+# Repo coordinates for the GitHub releases API. Bake them in here so the version
+# check works the same regardless of git remote / install path.
+$script:cwcReleaseRepo  = 'vinylflamingo/claude-win-container'
+$script:cwcVersionCache = Join-Path $cwcConfigDir 'version-cache.json'
+
+function Get-CwcImageClassification([string]$image) {
+    # Extract tag (everything after the last ':'). Default to 'latest' if no tag given.
+    $tag = if ($image -match ':([^:]+)$') { $Matches[1] } else { 'latest' }
+
+    if ($tag -eq 'dev') {
+        return [pscustomobject]@{ kind = 'dev'; version = $null; tag = $tag }
+    }
+    if ($tag -eq 'latest' -or $tag -match '^latest(-ltsc\d+)?$') {
+        return [pscustomobject]@{ kind = 'latest-tag'; version = $null; tag = $tag }
+    }
+    # Strip our base-image suffix (e.g. '0.1.1-ltsc2019' -> '0.1.1') so semver
+    # comparisons work uniformly. CI publishes both base-suffixed and bare tags.
+    $semverPart = $tag -replace '-ltsc\d+$', ''
+    # Preview/prerelease detection: the semver pre-release segment after the
+    # major.minor.patch (-rc.1, -alpha, -beta.2, -preview, -pre, etc.).
+    if ($semverPart -match '^\d+\.\d+\.\d+-(rc|alpha|beta|preview|pre)') {
+        return [pscustomobject]@{ kind = 'preview'; version = $semverPart; tag = $tag }
+    }
+    if ($semverPart -match '^\d+\.\d+\.\d+$') {
+        return [pscustomobject]@{ kind = 'stable'; version = $semverPart; tag = $tag }
+    }
+    return [pscustomobject]@{ kind = 'custom'; version = $null; tag = $tag }
+}
+
+# Returns the latest STABLE release version (e.g. '0.1.1') from GitHub, using a
+# 24-hour file cache so we don't hit the API on every launch. Returns $null when
+# offline / rate-limited / never-cached.
+function Get-CwcLatestStableVersion {
+    param([int]$CacheTtlHours = 24)
+
+    $cached = $null
+    if (Test-Path $script:cwcVersionCache) {
+        try {
+            $cached = Get-Content -LiteralPath $script:cwcVersionCache -Raw | ConvertFrom-Json
+            if ($cached.checked_at -and $cached.latest_stable) {
+                $age = (Get-Date) - [datetime]::Parse($cached.checked_at)
+                if ($age.TotalHours -lt $CacheTtlHours) {
+                    return [string]$cached.latest_stable
+                }
+            }
+        } catch { $cached = $null }
+    }
+
+    # Cache stale or missing -- ask GitHub. /releases/latest excludes prereleases
+    # by design, so the response is always a stable version.
+    try {
+        $url  = "https://api.github.com/repos/$($script:cwcReleaseRepo)/releases/latest"
+        $resp = Invoke-RestMethod -Uri $url -TimeoutSec 3 -Headers @{ 'User-Agent' = 'cwc' }
+        $version = ([string]$resp.tag_name) -replace '^v', ''
+        @{
+            checked_at    = (Get-Date).ToUniversalTime().ToString('o')
+            latest_stable = $version
+        } | ConvertTo-Json | Set-Content -LiteralPath $script:cwcVersionCache
+        return $version
+    } catch {
+        # Fall back to the (possibly stale) cached value rather than nothing.
+        if ($cached -and $cached.latest_stable) { return [string]$cached.latest_stable }
+        return $null
+    }
+}
+
+# Heuristic project-root detection. The same checks are used by the main launcher
+# flow before computing slug+state-dir, and by subcommands that refuse to operate
+# outside a project. -Force on the launcher bypasses this; subcommands don't honor
+# -Force because they don't need it (the user can always cd to the right dir).
+function Test-CwcInProjectRoot {
+    return (Test-Path '.git') -or (Test-Path 'package.json') -or `
+           (Test-Path '*.sln') -or (Test-Path '.mcp.json') -or `
+           (Test-Path 'pyproject.toml') -or (Test-Path 'go.mod') -or `
+           (Test-Path 'Cargo.toml')
+}
+
+# Loads the project config or exits with an actionable error if it doesn't exist.
+# Use this from subcommands that mutate per-project state. The main launcher flow
+# calls Read-CwcProjectConfig directly so it can trigger the auto-setup wizard
+# instead of bailing.
+function Get-RequiredCwcProjectConfig([string]$slug, [string]$projectDir) {
+    $cfg = Read-CwcProjectConfig $slug
+    if (-not $cfg) {
+        Write-Host ""
+        Write-Host "  No cwc config for this project yet." -ForegroundColor Yellow
+        Write-Host "  Run 'cwc setup' first (from $projectDir)." -ForegroundColor DarkGray
+        Write-Host ""
+        exit 1
+    }
+    return $cfg
+}
+
+# Project-scoped setup wizard. Walks the user through 6 questions and writes a
+# per-project config to ~/.cwc/projects/<slug>/config.json. Used by:
+#   - the explicit `cwc setup` subcommand (re-run to reconfigure a project)
+#   - the main launcher flow (auto-triggered when no project config exists)
+# Returns $true when a config was written, $false if the user bailed.
+# REQUIRES an interactive session -- callers must check Test-CwcInteractive first
+# (the auto-trigger does this and exits with a fail-closed message otherwise).
+function Invoke-CwcProjectSetup([string]$projectDir, [string]$slug) {
+    $meta = Get-CwcProjectMetadata $projectDir
+    $existing = Read-CwcProjectConfig $slug
+
+    Write-Host ""
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host "  cwc setup -- $($meta.name)" -ForegroundColor Cyan
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Project: $($meta.path)"
+    Write-Host "  Config : $(Get-CwcProjectConfigPath $slug)" -ForegroundColor DarkGray
+    Write-Host ""
+
+    if ($existing) {
+        Write-Host "  An existing config was found for this project:" -ForegroundColor Yellow
+        Write-Host "    Lockdown   : $(if ($existing.lockdown_lan) { 'enabled' } else { 'disabled' })"
+        Write-Host "    Allow CIDRs: $(if ($existing.allow_nets.Count) { ($existing.allow_nets) -join ', ' } else { '(none)' })"
+        if (@($existing.extra_hosts.Keys).Count -gt 0) {
+            $hostList = foreach ($k in $existing.extra_hosts.Keys) { "$k -> $($existing.extra_hosts[$k].target)" }
+            Write-Host "    Host maps  : $($hostList -join '; ')"
+        }
+        Write-Host "    Harden     : $(if ($existing.harden_enabled) { 'enabled' } else { 'disabled' })"
+        Write-Host ""
+        if (-not (Read-CwcYesNo "  Reconfigure (this replaces the existing project config)?" $false)) {
+            Write-Host "  Keeping existing config." -ForegroundColor DarkGray
+            Write-Host ""
+            return $false
+        }
+        Write-Host ""
+    }
+
+    Write-Host "  Answer these questions to set up the sandbox for THIS project."
+    Write-Host "  Press Enter at any [y/N] to accept the default. Change anything later"
+    Write-Host "  with 'cwc firewall ...', 'cwc mount ...', or 'cwc harden ...'."
+    Write-Host ""
+
+    $cfg = [pscustomobject]@{
+        project_path   = $meta.path
+        project_name   = $meta.name
+        lockdown_lan   = $true
+        harden_enabled = $false
+        allow_nets     = @()
+        extra_hosts    = @{}
+        mounts         = @{}
+        trusted_files  = if ($existing -and $existing.trusted_files) { $existing.trusted_files } else { @{} }
+    }
+
+    # Q1 -- public internet (informational)
+    Write-Host "1. Public internet (Anthropic API, npm registry, GitHub):" -ForegroundColor Green
+    Write-Host "   Always allowed. Required for Claude to function."
+    Write-Host ""
+
+    # Q2 -- LAN subnets
+    Write-Host "2. LAN services" -ForegroundColor Green
+    Write-Host "   Examples: a network printer at 192.168.1.50, a NAS at 10.0.0.5,"
+    Write-Host "   another machine on your dev network."
+    if (Read-CwcYesNo "   Do you need to reach any LAN subnets?") {
+        Write-Host "   Enter CIDRs (e.g. 192.168.1.0/24, 10.5.0.0/16). Press Enter at"
+        Write-Host "   the next prompt to stop adding."
+        while ($true) {
+            $cidr = Read-Host "     CIDR (or Enter to finish)"
+            if (-not $cidr -or -not $cidr.Trim()) { break }
+            $cidr = $cidr.Trim()
+            if ($cidr -notmatch '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') {
+                Write-Host "     '$cidr' doesn't look like a CIDR. Try again." -ForegroundColor Yellow
+                continue
+            }
+            $cfg.allow_nets += $cidr
+            Write-Host "     OK added $cidr" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ""
+
+    # Q3 -- host services with port list + canonical 'host' alias + optional extras
+    Write-Host "3. Services on your Docker host" -ForegroundColor Green
+    Write-Host "   Examples: a Next.js / Vite dev server on :3000, Traefik on :443,"
+    Write-Host "   a local Postgres on :5432, an SSH tunnel on :22. The agent reaches"
+    Write-Host "   them as http://host:<port> from inside the container."
+    if (Read-CwcYesNo "   Do you need to reach any?") {
+        Write-Host "   Enter a comma-separated list of TCP ports to expose:"
+        Write-Host "     80, 443           (HTTP/HTTPS - reverse proxy / API gateway)"
+        Write-Host "     3000, 5173, 8080  (typical dev servers)"
+        Write-Host "     22, 5432          (SSH, Postgres)"
+        $ports = @()
+        while ($true) {
+            $portsRaw = Read-Host "     Ports (comma-separated)"
+            if (-not $portsRaw -or -not $portsRaw.Trim()) {
+                Write-Host "     Required (or answer no above to skip this step)." -ForegroundColor Yellow
+                continue
+            }
+            $ports = @()
+            $bad = $false
+            foreach ($p in $portsRaw.Split(',')) {
+                $p = $p.Trim()
+                if (-not $p) { continue }
+                $parsed = 0
+                if (-not [int]::TryParse($p, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt 65535) {
+                    Write-Host "     Invalid port '$p' (must be 1-65535). Try again." -ForegroundColor Yellow
+                    $bad = $true
+                    break
+                }
+                $ports += $parsed
+            }
+            if (-not $bad -and $ports.Count -gt 0) { break }
+        }
+
+        # Canonical 'host' alias is what we tell agents to use, so it's always present
+        # whenever Q3 is enabled.
+        $cfg.extra_hosts['host'] = @{ target = 'host-gateway'; ports = $ports }
+        Write-Host "     OK host -> host-gateway  ports=$($ports -join ',')" -ForegroundColor DarkGray
+        Write-Host ""
+
+        Write-Host "   Optional: any additional hostnames to map (e.g. api.test, dev.local)?"
+        Write-Host "   Each shares the same port list. Avoid '.localhost' as a suffix --"
+        Write-Host "   RFC 6761 reserves it for loopback and some libraries hardcode that."
+        if (Read-CwcYesNo "   Add custom hostnames?" $false) {
+            while ($true) {
+                $fqdn = Read-Host "     Hostname (or Enter to finish)"
+                if (-not $fqdn -or -not $fqdn.Trim()) { break }
+                $fqdn = $fqdn.Trim()
+                if (-not (Test-CwcFqdn $fqdn)) {
+                    Write-Host "     Invalid hostname '$fqdn'. Use lowercase letters/digits/hyphens, dot-separated." -ForegroundColor Yellow
+                    continue
+                }
+                $cfg.extra_hosts[$fqdn] = @{ target = 'host-gateway'; ports = $ports }
+                Write-Host "     OK $fqdn -> host-gateway  ports=$($ports -join ',')" -ForegroundColor DarkGray
+            }
+        }
+
+        Write-Host ""
+        Write-Host "   To use a host service, tell the agent to reach it at" -ForegroundColor Cyan
+        Write-Host "   http://host:<port> -- e.g. 'the dev server is at http://host:3000'." -ForegroundColor Cyan
+    }
+    Write-Host ""
+
+    # Q4 -- explicit FQDN -> IP (advanced)
+    Write-Host "4. Custom FQDN -> IP mappings" -ForegroundColor Green
+    Write-Host "   Less common. Use this if you want to map a name to a specific IP"
+    Write-Host "   that isn't your Docker host (e.g. legacy.box -> 10.5.1.20)."
+    if (Read-CwcYesNo "   Add any custom mappings?") {
+        while ($true) {
+            $fqdn = Read-Host "     FQDN (or Enter to finish)"
+            if (-not $fqdn -or -not $fqdn.Trim()) { break }
+            $fqdn = $fqdn.Trim()
+            if (-not (Test-CwcFqdn $fqdn)) {
+                Write-Host "     Invalid FQDN '$fqdn'. Use lowercase letters/digits/hyphens, dot-separated." -ForegroundColor Yellow
+                continue
+            }
+            $ip = Read-CwcNonEmpty "     IP for $fqdn"
+            if (-not (Test-CwcHostTarget $ip)) {
+                Write-Host "     '$ip' isn't a valid IP. Try again." -ForegroundColor Yellow
+                continue
+            }
+            $cfg.extra_hosts[$fqdn] = @{ target = $ip; ports = @(443, 80) }
+            # Auto-add containing /24 to allow_nets if it's RFC1918 and not already covered
+            if ($ip -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$' -and
+                $ip -match '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)') {
+                $cidr = "$($Matches[1]).0/24"
+                if ($cfg.allow_nets -notcontains $cidr) {
+                    Write-Host "     (auto-allowing $cidr so $ip is reachable)" -ForegroundColor DarkGray
+                    $cfg.allow_nets += $cidr
+                }
+            }
+            Write-Host "     OK $fqdn -> $ip" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ""
+
+    # Q5 -- extra folder mounts
+    Write-Host "5. Extra folders" -ForegroundColor Green
+    Write-Host "   Mount additional folders into the container so claude can read them."
+    Write-Host "   Common: an Obsidian vault, design specs, runbooks. Each gets a name and"
+    Write-Host "   shows up at C:\docs\<name> inside the container. Read-only by default."
+    if (Read-CwcYesNo "   Add any folder mounts?") {
+        while ($true) {
+            $name = Read-Host "     Name (e.g. obsidian, specs -- Enter to finish)"
+            if (-not $name -or -not $name.Trim()) { break }
+            $name = $name.Trim()
+            if ($name -match '[^a-zA-Z0-9._-]') {
+                Write-Host "     Name must be alphanumeric (with . _ - allowed)." -ForegroundColor Yellow
+                continue
+            }
+            $path = Read-CwcNonEmpty "     Host path (e.g. C:\Users\you\Obsidian\Notes)"
+            if (-not (Test-Path -LiteralPath $path)) {
+                Write-Host "     Path doesn't exist -- adding anyway, you can create it later." -ForegroundColor Yellow
+            } else {
+                $path = (Resolve-Path -LiteralPath $path).Path
+            }
+            $writable = Read-CwcYesNo "     Make it writable? (default: read-only)" $false
+            $cfg.mounts[$name] = @{
+                source   = $path
+                target   = "C:\docs\$name"
+                readonly = (-not $writable)
+            }
+            $modeLabel = if ($writable) { 'RW' } else { 'RO' }
+            Write-Host "     OK $name [$modeLabel] $path -> C:\docs\$name" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ""
+
+    # Q6 -- harden offer (per-project)
+    Write-Host "6. Tamper-resistant hardening" -ForegroundColor Green
+    Write-Host "   The default LAN lockdown is enforced inside the container -- code with"
+    Write-Host "   admin rights in the container (which Claude has) can disable it via"
+    Write-Host "   ``Remove-NetRoute``. 'Harden' adds an in-container watchdog that"
+    Write-Host "   re-applies the routes every 2s, restores the hosts file from snapshot"
+    Write-Host "   if changed, removes unauthorised routes, and logs new trust-store CAs."
+    Write-Host ""
+    Write-Host "   Trade-off: a bigger speed-bump, not real isolation. A determined agent"
+    Write-Host "   can still defeat it. See docs/security.md."
+    Write-Host ""
+    Write-Host "   Recommended: ON. Toggle later with 'cwc harden enable/disable'."
+    if (Read-CwcYesNo "   Enable hardening for this project?" $true) {
+        $cfg.harden_enabled = $true
+        Write-Host "     OK harden enabled" -ForegroundColor DarkGray
+    } else {
+        $cfg.harden_enabled = $false
+        Write-Host "     x harden disabled" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
+    # Summary
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host "  Summary" -ForegroundColor Cyan
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  LAN lockdown : enabled"
+    Write-Host "  Harden       : $(if ($cfg.harden_enabled) { 'ENABLED' } else { 'disabled' })"
+    Write-Host "  Allow CIDRs  : $(if ($cfg.allow_nets.Count) { $cfg.allow_nets -join ', ' } else { '(none)' })"
+    if (@($cfg.extra_hosts.Keys).Count -gt 0) {
+        Write-Host "  Host mappings:"
+        foreach ($k in $cfg.extra_hosts.Keys) {
+            $entry = $cfg.extra_hosts[$k]
+            Write-Host "    $k -> $($entry.target)  ports=$($entry.ports -join ',')"
+        }
+    } else {
+        Write-Host "  Host mappings: (none)"
+    }
+    if (@($cfg.mounts.Keys).Count -gt 0) {
+        Write-Host "  Folder mounts:"
+        foreach ($k in $cfg.mounts.Keys) {
+            $m = $cfg.mounts[$k]
+            $mode = if ($m.readonly) { 'RO' } else { 'RW' }
+            Write-Host "    $k [$mode]  $($m.source) -> $($m.target)"
+        }
+    } else {
+        Write-Host "  Folder mounts: (none)"
+    }
+    Write-Host ""
+
+    if (Read-CwcYesNo "  Save this config?" $true) {
+        Write-CwcProjectConfig $slug $cfg
+        Write-Host "  OK saved to $(Get-CwcProjectConfigPath $slug)" -ForegroundColor Green
+        Write-Host ""
+        return $true
+    } else {
+        Write-Host "  Discarded. No changes written." -ForegroundColor DarkGray
+        Write-Host ""
+        return $false
+    }
+}
+
+# 0ba. `cwc dev ...` -- session-scoped dev-mode launches + management subcommands.
+# `cwc dev` (no other args) launches `claude` in the :dev image, building it locally
+# from the Dockerfile next to cwc.ps1 if it doesn't exist yet. Falls through to the
+# main launcher flow with $env:CWC_IMAGE rebound, so all the normal trust/setup/etc.
+# paths still apply -- it's just a different image.
+#
+# `cwc dev <command>` runs <command> in the :dev container the same way. Host-side
+# subcommands (setup/firewall/mount/trust/harden/auth/help) reject the wrapper --
+# they don't need a container.
+#
+# Management subcommands (no container, just docker actions on the :dev tag):
+#   cwc dev build       build :dev (compose build claude-code)
+#   cwc dev rebuild     remove :dev then build --no-cache
+#   cwc dev clean       remove :dev image
+#   cwc dev status      show image presence + clone path + flag settings
+#   cwc dev flag list                       show all flags + values
+#   cwc dev flag set <name> <on|off>        set a persistent flag
+#   cwc dev flag unset <name>               restore a flag to its default
+if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'dev') {
+    $devSub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { '' }
+
+    # Management subcommands -- no container, no fall-through. Each requires a clone
+    # because we have nothing useful to do without the Dockerfile (build/rebuild) or
+    # because reporting "running from clone? yes/no" is part of the answer (status).
+    if ($devSub -in @('build','rebuild','clean','status','flag')) {
+        if (-not (Test-CwcInClone) -and $devSub -ne 'flag' -and $devSub -ne 'status' -and $devSub -ne 'clean') {
+            Write-Host ""
+            Write-Host "  cwc dev $devSub requires running from a git clone of the repo." -ForegroundColor Red
+            Write-Host "  (No Dockerfile next to cwc.ps1.)"
+            Write-Host ""
+            exit 1
+        }
+        switch ($devSub) {
+            'build' {
+                Write-Host "[cwc dev] building $cwcDevImage..." -ForegroundColor Cyan
+                $env:CWC_IMAGE = $cwcDevImage
+                & docker compose -f (Join-Path $scriptRoot 'docker-compose.yml') build claude-code
+                if ($LASTEXITCODE -ne 0) { Write-Host "[cwc dev] build failed" -ForegroundColor Red; exit 1 }
+                Write-Host "[cwc dev] built $cwcDevImage" -ForegroundColor Green
+            }
+            'rebuild' {
+                Write-Host "[cwc dev] removing $cwcDevImage and rebuilding from scratch..." -ForegroundColor Cyan
+                docker image rm $cwcDevImage *> $null   # tolerate "not found"
+                $env:CWC_IMAGE = $cwcDevImage
+                & docker compose -f (Join-Path $scriptRoot 'docker-compose.yml') build --no-cache claude-code
+                if ($LASTEXITCODE -ne 0) { Write-Host "[cwc dev] rebuild failed" -ForegroundColor Red; exit 1 }
+                Write-Host "[cwc dev] rebuilt $cwcDevImage (no cache)" -ForegroundColor Green
+            }
+            'clean' {
+                docker image inspect $cwcDevImage *> $null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[cwc dev] $cwcDevImage not found locally -- nothing to clean." -ForegroundColor DarkGray
+                    exit 0
+                }
+                docker image rm $cwcDevImage
+                if ($LASTEXITCODE -ne 0) { Write-Host "[cwc dev] image rm failed" -ForegroundColor Red; exit 1 }
+                Write-Host "[cwc dev] removed $cwcDevImage" -ForegroundColor Yellow
+            }
+            'status' {
+                docker image inspect $cwcDevImage *> $null
+                $imgPresent = ($LASTEXITCODE -eq 0)
+                $inClone    = Test-CwcInClone
+                $flags      = Read-CwcDevConfig
+                Write-Host ""
+                Write-Host "  cwc dev status" -ForegroundColor Cyan
+                Write-Host "    image      : $cwcDevImage"
+                Write-Host "    image local: $(if ($imgPresent) { 'present' } else { 'MISSING (run cwc dev build)' })" -ForegroundColor $(if ($imgPresent) { 'Green' } else { 'Yellow' })
+                Write-Host "    clone      : $(if ($inClone) { $scriptRoot } else { 'NOT a clone (run from a clone of the repo)' })" -ForegroundColor $(if ($inClone) { 'Green' } else { 'Yellow' })
+                Write-Host "    config     : $cwcDevConfigPath"
+                Write-Host ""
+                Write-Host "  Flags" -ForegroundColor Cyan
+                foreach ($k in ($flags.Keys | Sort-Object)) {
+                    $val = if ($flags[$k]) { 'on' } else { 'off' }
+                    $isDefault = ($flags[$k] -eq $script:cwcDevFlagDefaults[$k])
+                    $tag = if ($isDefault) { '(default)' } else { '(custom)' }
+                    Write-Host "    $k = $val  $tag"
+                }
+                Write-Host ""
+            }
+            'flag' {
+                $flagSub  = if ($Cmd.Count -ge 3) { $Cmd[2] } else { 'list' }
+                $flagName = if ($Cmd.Count -ge 4) { $Cmd[3] } else { $null }
+                $flagVal  = if ($Cmd.Count -ge 5) { $Cmd[4] } else { $null }
+                $flags = Read-CwcDevConfig
+                switch ($flagSub) {
+                    'list' {
+                        Write-Host ""
+                        Write-Host "  Dev flags (set with 'cwc dev flag set <name> <on|off>'):" -ForegroundColor Cyan
+                        foreach ($k in ($flags.Keys | Sort-Object)) {
+                            $val = if ($flags[$k]) { 'on' } else { 'off' }
+                            $def = if ($script:cwcDevFlagDefaults[$k]) { 'on' } else { 'off' }
+                            Write-Host "    $k = $val  (default: $def)"
+                        }
+                        Write-Host ""
+                    }
+                    'set' {
+                        if (-not $flagName -or -not $flagVal) {
+                            Write-Host "Usage: cwc dev flag set <name> <on|off>" -ForegroundColor Red
+                            exit 1
+                        }
+                        if (-not $script:cwcDevFlagDefaults.ContainsKey($flagName)) {
+                            Write-Host "Unknown flag: '$flagName'. Run 'cwc dev flag list' to see available flags." -ForegroundColor Red
+                            exit 1
+                        }
+                        $bool = switch -Regex ($flagVal.ToString().ToLower()) {
+                            '^(on|true|1|yes|y)$'  { $true; break }
+                            '^(off|false|0|no|n)$' { $false; break }
+                            default { Write-Host "Value must be on|off (got '$flagVal')." -ForegroundColor Red; exit 1 }
+                        }
+                        $flags[$flagName] = $bool
+                        Write-CwcDevConfig $flags
+                        Write-Host "Set $flagName = $(if ($bool) { 'on' } else { 'off' })" -ForegroundColor Green
+                    }
+                    'unset' {
+                        if (-not $flagName) { Write-Host "Usage: cwc dev flag unset <name>" -ForegroundColor Red; exit 1 }
+                        if (-not $script:cwcDevFlagDefaults.ContainsKey($flagName)) {
+                            Write-Host "Unknown flag: '$flagName'." -ForegroundColor Red
+                            exit 1
+                        }
+                        $flags[$flagName] = [bool]$script:cwcDevFlagDefaults[$flagName]
+                        Write-CwcDevConfig $flags
+                        Write-Host "Reset $flagName to default ($(if ($flags[$flagName]) { 'on' } else { 'off' }))" -ForegroundColor Yellow
+                    }
+                    default {
+                        Write-Host "Usage: cwc dev flag {list|set <name> <on|off>|unset <name>}" -ForegroundColor Red
+                        exit 1
+                    }
+                }
+            }
+        }
+        exit 0
+    }
+
+    # Wrapping host-side subcommands in `cwc dev` is meaningless -- they never start
+    # a container. Refuse with a hint instead of silently doing the wrong thing.
+    $hostSubs = @('setup','firewall','mount','trust','untrust','harden','auth','help','-Help','-h')
+    if ($devSub -in $hostSubs) {
+        Write-Host ""
+        Write-Host "  '$devSub' is host-side -- run 'cwc $devSub ...' (no 'dev' wrapper needed)." -ForegroundColor Yellow
+        Write-Host ""
+        exit 1
+    }
+
+    # Session start. Require a clone (we need the Dockerfile to build :dev), set the
+    # image env, ensure :dev exists locally (build inline if missing), apply persistent
+    # flags, and FALL THROUGH to the main launcher flow with 'dev' stripped from $Cmd.
+    if (-not (Test-CwcInClone)) {
+        Write-Host ""
+        Write-Host "  cwc dev requires running from a git clone of the repo." -ForegroundColor Red
+        Write-Host "  (No Dockerfile next to cwc.ps1 at $scriptRoot.)"
+        Write-Host "  Clone https://github.com/vinylflamingo/claude-win-container, then point your alias at the clone."
+        Write-Host ""
+        exit 1
+    }
+
+    $script:cwcDevMode = $true
+    $env:CWC_IMAGE     = $cwcDevImage
+
+    docker image inspect $cwcDevImage *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[cwc dev] $cwcDevImage missing -- building from local Dockerfile..." -ForegroundColor Cyan
+        Write-Host "[cwc dev] (first build is ~5-10 min; subsequent builds are layer-cached)" -ForegroundColor DarkGray
+        & docker compose -f (Join-Path $scriptRoot 'docker-compose.yml') build claude-code
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[cwc dev] build failed" -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    $devFlags = Read-CwcDevConfig
+    if ($devFlags.live_entrypoint_mount) {
+        $entrypointSrc = Join-Path $scriptRoot 'entrypoint.ps1'
+        if (Test-Path -LiteralPath $entrypointSrc) {
+            $script:cwcDevExtraMounts += @('--volume', "${entrypointSrc}:C:\entrypoint.ps1:ro")
+            Write-Host "[cwc dev] live entrypoint mount: $entrypointSrc -> C:\entrypoint.ps1 (ro)" -ForegroundColor Magenta
+        } else {
+            Write-Host "[cwc dev] live_entrypoint_mount on, but $entrypointSrc not found -- skipping mount." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "[cwc dev] running with $cwcDevImage" -ForegroundColor Magenta
+
+    # Strip 'dev' from $Cmd so the main flow sees the underlying command (or empty
+    # for "just launch claude").
+    $Cmd = if ($Cmd.Count -ge 2) { $Cmd[1..($Cmd.Count - 1)] } else { @() }
+    # Fall through.
+}
+
+# 0bb. `cwc setup` -- per-project setup wizard.
+# Walks the user through 6 questions and writes ~/.cwc/projects/<slug>/config.json.
+# This is the ONLY way to create that file; main launcher flow auto-triggers this
+# (interactively) on first `cwc` in an unconfigured project, but the user can also
+# run it explicitly to reconfigure.
+if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'setup') {
+    if (-not (Test-CwcInProjectRoot)) {
+        Write-Host ""
+        Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
+        Write-Host "  cwc setup configures one project at a time -- cd to a project first."
+        Write-Host ""
+        exit 1
+    }
+    if (-not (Test-CwcInteractive)) {
+        Write-Host ""
+        Write-Host "  cwc setup requires an interactive session (it asks questions)." -ForegroundColor Red
+        Write-Host "  Re-run from a real terminal."
+        Write-Host ""
+        exit 1
+    }
+    $slugForSetup = Get-ProjectSlug $projectDir
+    $saved = Invoke-CwcProjectSetup -ProjectDir $projectDir -Slug $slugForSetup
+    if ($saved) {
+        Write-Host "  Setup complete. Run 'cwc' from this directory to launch." -ForegroundColor Green
+        Write-Host ""
+    }
+    exit 0
 }
 
 # 0c. `cwc firewall ...` subcommand
-# Persistent user-wide config; doesn't require a project directory or a running container.
+# Two scopes:
+#   denylist {list|add|remove|reset}  -- GLOBAL (security policy applied to every project).
+#   everything else                   -- PER-PROJECT (operates on the current directory's
+#                                        config; requires a project root and 'cwc setup' first).
 if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
     $sub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { 'list' }
     $arg = if ($Cmd.Count -ge 3) { $Cmd[2] } else { $null }
-    $cfg = Read-CwcConfig
+
+    # Denylist is global (cross-project security policy). Handle it before the
+    # project-root check so it's usable from anywhere.
+    if ($sub -eq 'denylist') {
+        $sub2 = if ($Cmd.Count -ge 3) { $Cmd[2] } else { 'list' }
+        $denyArg = if ($Cmd.Count -ge 4) { $Cmd[3] } else { $null }
+        $globalCfg = Read-CwcGlobalConfig
+        $denylist = @($globalCfg.host_denylist)
+        switch ($sub2) {
+            'list' {
+                Write-Host ""
+                if ($denylist.Count -gt 0) {
+                    Write-Host "  Host denylist (cwc firewall host-add refuses these):" -ForegroundColor Cyan
+                    $defaults = Get-CwcDefaultDenylist
+                    foreach ($p in ($denylist | Sort-Object)) {
+                        $tag = if ($defaults -contains $p) { '(default)' } else { '(custom)' }
+                        Write-Host "    $p  $tag"
+                    }
+                } else {
+                    Write-Host "  (denylist empty -- no FQDNs are refused)" -ForegroundColor Yellow
+                }
+                Write-Host ""
+            }
+            'add' {
+                if (-not $denyArg) { Write-Host "Usage: cwc firewall denylist add <fqdn-or-pattern>" -ForegroundColor Red; exit 1 }
+                $pattern = $denyArg.ToLowerInvariant()
+                if ($denylist -notcontains $pattern) {
+                    $globalCfg.host_denylist = @($denylist) + $pattern
+                    Write-CwcGlobalConfig $globalCfg
+                    Write-Host "Denylisted: $pattern" -ForegroundColor Green
+                } else {
+                    Write-Host "$pattern already denylisted." -ForegroundColor DarkGray
+                }
+            }
+            'remove' {
+                if (-not $denyArg) { Write-Host "Usage: cwc firewall denylist remove <pattern>" -ForegroundColor Red; exit 1 }
+                $pattern = $denyArg.ToLowerInvariant()
+                $defaults = Get-CwcDefaultDenylist
+                if ($defaults -contains $pattern) {
+                    Write-Host ""
+                    Write-Host "  WARNING: '$pattern' is a default denylist entry." -ForegroundColor Yellow
+                    Write-Host "  Removing it could allow agents to redirect Anthropic auth traffic via" -ForegroundColor Yellow
+                    Write-Host "  hosts-file injection -- exfiltrating your API key on the next session." -ForegroundColor Yellow
+                    Write-Host ""
+                    $resp = Read-Host "  Remove anyway? [y/N]"
+                    if ($resp -notmatch '^(y|yes)$') {
+                        Write-Host "  Cancelled." -ForegroundColor DarkGray
+                        exit 0
+                    }
+                }
+                $newList = @($denylist | Where-Object { $_ -ne $pattern })
+                if ($newList.Count -lt $denylist.Count) {
+                    $globalCfg.host_denylist = $newList
+                    Write-CwcGlobalConfig $globalCfg
+                    Write-Host "Removed: $pattern" -ForegroundColor Yellow
+                } else {
+                    Write-Host "$pattern not in denylist." -ForegroundColor DarkGray
+                }
+            }
+            'reset' {
+                $globalCfg.host_denylist = @(Get-CwcDefaultDenylist)
+                Write-CwcGlobalConfig $globalCfg
+                Write-Host "Denylist reset to defaults." -ForegroundColor Green
+            }
+            default {
+                Write-Host "Unknown denylist subcommand: $sub2" -ForegroundColor Red
+                Write-Host "Usage: cwc firewall denylist {list|add <pattern>|remove <pattern>|reset}"
+                exit 1
+            }
+        }
+        exit 0
+    }
+
+    # Everything else is per-project. Require a project root + an existing project config.
+    if (-not (Test-CwcInProjectRoot)) {
+        Write-Host ""
+        Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
+        Write-Host "  cwc firewall operates per-project -- cd to a project directory first."
+        Write-Host ""
+        exit 1
+    }
+    $slugForFirewall = Get-ProjectSlug $projectDir
+    $cfg = Get-RequiredCwcProjectConfig $slugForFirewall $projectDir
+    # Denylist is consulted for host-add validation; pull from global.
+    $globalDenylist = (Read-CwcGlobalConfig).host_denylist
 
     switch ($sub) {
         'list' {
             $state = if ($cfg.lockdown_lan) { 'enabled' } else { 'disabled' }
             Write-Host ""
-            Write-Host "  LAN lockdown : $state" -ForegroundColor Cyan
+            Write-Host "  Project      : $projectDir" -ForegroundColor Cyan
+            Write-Host "  LAN lockdown : $state"
             Write-Host "  Allow-list   : $(if ($cfg.allow_nets.Count) { $cfg.allow_nets -join ', ' } else { '(none)' })"
             if (@($cfg.extra_hosts.Keys).Count -gt 0) {
                 Write-Host "  Host mappings:"
@@ -418,7 +1255,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
             }
             $hardenStateLabel = if ($cfg.harden_enabled) { 'enabled' } else { 'disabled' }
             Write-Host "  Harden       : $hardenStateLabel"
-            Write-Host "  Config file  : $cwcConfigPath"
+            Write-Host "  Config file  : $(Get-CwcProjectConfigPath $slugForFirewall)"
             Write-Host ""
             Write-Host "  Shell env CWC_* (one-shot) overrides this config; project .env does not." -ForegroundColor DarkGray
             Write-Host ""
@@ -427,7 +1264,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
             if (-not $arg) { Write-Host "Usage: cwc firewall allow <cidr>" -ForegroundColor Red; exit 1 }
             if ($cfg.allow_nets -notcontains $arg) {
                 $cfg.allow_nets = @($cfg.allow_nets) + $arg
-                Write-CwcConfig $cfg
+                Write-CwcProjectConfig $slugForFirewall $cfg
                 Write-Host "Allowed: $arg" -ForegroundColor Green
             } else {
                 Write-Host "$arg already in allow-list." -ForegroundColor DarkGray
@@ -438,7 +1275,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
             $before = @($cfg.allow_nets).Count
             $cfg.allow_nets = @($cfg.allow_nets | Where-Object { $_ -ne $arg })
             if (@($cfg.allow_nets).Count -lt $before) {
-                Write-CwcConfig $cfg
+                Write-CwcProjectConfig $slugForFirewall $cfg
                 Write-Host "Removed: $arg" -ForegroundColor Yellow
             } else {
                 Write-Host "$arg was not in allow-list." -ForegroundColor DarkGray
@@ -446,13 +1283,13 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
         }
         'enable' {
             $cfg.lockdown_lan = $true
-            Write-CwcConfig $cfg
-            Write-Host "LAN lockdown enabled." -ForegroundColor Green
+            Write-CwcProjectConfig $slugForFirewall $cfg
+            Write-Host "LAN lockdown enabled for this project." -ForegroundColor Green
         }
         'disable' {
             $cfg.lockdown_lan = $false
-            Write-CwcConfig $cfg
-            Write-Host "LAN lockdown disabled." -ForegroundColor Yellow
+            Write-CwcProjectConfig $slugForFirewall $cfg
+            Write-Host "LAN lockdown disabled for this project." -ForegroundColor Yellow
         }
         'host-list' {
             Write-Host ""
@@ -492,7 +1329,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
                 Write-Host "  Target must be 'host-gateway' or a valid IPv4/IPv6 address."
                 exit 1
             }
-            if (Test-CwcFqdnDenied -fqdn $arg -denylist @($cfg.host_denylist)) {
+            if (Test-CwcFqdnDenied -fqdn $arg -denylist @($globalDenylist)) {
                 Write-Host "Refused: '$arg' matches the host-add denylist." -ForegroundColor Red
                 Write-Host "  Mapping this FQDN could redirect Anthropic auth traffic via hosts-file injection."
                 Write-Host "  Run 'cwc firewall denylist list' to see active rules."
@@ -523,7 +1360,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
             $ports = @($ports | Select-Object -Unique)
 
             $cfg.extra_hosts[$arg] = @{ target = $target; ports = $ports }
-            Write-CwcConfig $cfg
+            Write-CwcProjectConfig $slugForFirewall $cfg
             Write-Host "Mapped: $arg -> $target  ports=$($ports -join ',')" -ForegroundColor Green
             if ($target -ne 'host-gateway') {
                 if ($target -match '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' -and
@@ -537,77 +1374,10 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
             if (-not $arg) { Write-Host "Usage: cwc firewall host-remove <fqdn>" -ForegroundColor Red; exit 1 }
             if ($cfg.extra_hosts.ContainsKey($arg)) {
                 $cfg.extra_hosts.Remove($arg)
-                Write-CwcConfig $cfg
+                Write-CwcProjectConfig $slugForFirewall $cfg
                 Write-Host "Removed: $arg" -ForegroundColor Yellow
             } else {
                 Write-Host "$arg was not mapped." -ForegroundColor DarkGray
-            }
-        }
-        'denylist' {
-            $sub2 = if ($Cmd.Count -ge 3) { $Cmd[2] } else { 'list' }
-            $denyArg = if ($Cmd.Count -ge 4) { $Cmd[3] } else { $null }
-            $denylist = @($cfg.host_denylist)
-            switch ($sub2) {
-                'list' {
-                    Write-Host ""
-                    if ($denylist.Count -gt 0) {
-                        Write-Host "  Host denylist (cwc firewall host-add refuses these):" -ForegroundColor Cyan
-                        $defaults = Get-CwcDefaultDenylist
-                        foreach ($p in ($denylist | Sort-Object)) {
-                            $tag = if ($defaults -contains $p) { '(default)' } else { '(custom)' }
-                            Write-Host "    $p  $tag"
-                        }
-                    } else {
-                        Write-Host "  (denylist empty -- no FQDNs are refused)" -ForegroundColor Yellow
-                    }
-                    Write-Host ""
-                }
-                'add' {
-                    if (-not $denyArg) { Write-Host "Usage: cwc firewall denylist add <fqdn-or-pattern>" -ForegroundColor Red; exit 1 }
-                    $pattern = $denyArg.ToLowerInvariant()
-                    if ($denylist -notcontains $pattern) {
-                        $cfg.host_denylist = @($denylist) + $pattern
-                        Write-CwcConfig $cfg
-                        Write-Host "Denylisted: $pattern" -ForegroundColor Green
-                    } else {
-                        Write-Host "$pattern already denylisted." -ForegroundColor DarkGray
-                    }
-                }
-                'remove' {
-                    if (-not $denyArg) { Write-Host "Usage: cwc firewall denylist remove <pattern>" -ForegroundColor Red; exit 1 }
-                    $pattern = $denyArg.ToLowerInvariant()
-                    $defaults = Get-CwcDefaultDenylist
-                    if ($defaults -contains $pattern) {
-                        Write-Host ""
-                        Write-Host "  WARNING: '$pattern' is a default denylist entry." -ForegroundColor Yellow
-                        Write-Host "  Removing it could allow agents to redirect Anthropic auth traffic via" -ForegroundColor Yellow
-                        Write-Host "  hosts-file injection -- exfiltrating your API key on the next session." -ForegroundColor Yellow
-                        Write-Host ""
-                        $resp = Read-Host "  Remove anyway? [y/N]"
-                        if ($resp -notmatch '^(y|yes)$') {
-                            Write-Host "  Cancelled." -ForegroundColor DarkGray
-                            exit 0
-                        }
-                    }
-                    $newList = @($denylist | Where-Object { $_ -ne $pattern })
-                    if ($newList.Count -lt $denylist.Count) {
-                        $cfg.host_denylist = $newList
-                        Write-CwcConfig $cfg
-                        Write-Host "Removed: $pattern" -ForegroundColor Yellow
-                    } else {
-                        Write-Host "$pattern not in denylist." -ForegroundColor DarkGray
-                    }
-                }
-                'reset' {
-                    $cfg.host_denylist = @(Get-CwcDefaultDenylist)
-                    Write-CwcConfig $cfg
-                    Write-Host "Denylist reset to defaults." -ForegroundColor Green
-                }
-                default {
-                    Write-Host "Unknown denylist subcommand: $sub2" -ForegroundColor Red
-                    Write-Host "Usage: cwc firewall denylist {list|add <pattern>|remove <pattern>|reset}"
-                    exit 1
-                }
             }
         }
         default {
@@ -621,12 +1391,21 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'firewall') {
     exit 0
 }
 
-# `cwc mount ...` subcommand. Manages persistent additional bind-mounts (e.g. an Obsidian
-# vault, design-spec folder, runbooks). Source paths are mounted into the container at
-# C:\docs\<name> by default; readonly is the default. Stored alongside firewall config.
+# `cwc mount ...` subcommand -- per-project. Manages additional bind-mounts (e.g. an
+# Obsidian vault, design-spec folder, runbooks) for THIS project. Source paths are
+# mounted into the container at C:\docs\<name> by default; readonly is the default.
+# Different projects can mount different things without leaking into each other.
 if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'mount') {
     $sub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { 'list' }
-    $cfg = Read-CwcConfig
+    if (-not (Test-CwcInProjectRoot)) {
+        Write-Host ""
+        Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
+        Write-Host "  cwc mount operates per-project -- cd to a project directory first."
+        Write-Host ""
+        exit 1
+    }
+    $slugForMount = Get-ProjectSlug $projectDir
+    $cfg = Get-RequiredCwcProjectConfig $slugForMount $projectDir
     if (-not $cfg.mounts) { $cfg.mounts = @{} }
 
     $reservedNames = @('workspace','claude-data','command-history','claude-auth')
@@ -676,7 +1455,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'mount') {
                 target   = "C:\docs\$name"
                 readonly = ($mode -eq 'ro')
             }
-            Write-CwcConfig $cfg
+            Write-CwcProjectConfig $slugForMount $cfg
             $modeLabel = if ($mode -eq 'ro') { 'readonly' } else { 'writable' }
             Write-Host "Added: $name  [$modeLabel]  $source -> C:\docs\$name" -ForegroundColor Green
         }
@@ -685,7 +1464,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'mount') {
             if (-not $name) { Write-Host "Usage: cwc mount remove <name>" -ForegroundColor Red; exit 1 }
             if ($cfg.mounts.ContainsKey($name)) {
                 $cfg.mounts.Remove($name)
-                Write-CwcConfig $cfg
+                Write-CwcProjectConfig $slugForMount $cfg
                 Write-Host "Removed: $name" -ForegroundColor Yellow
             } else {
                 Write-Host "'$name' is not configured." -ForegroundColor DarkGray
@@ -706,11 +1485,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'mount') {
 # from inside the container; trust forces the dev to ack changes before they take effect.
 if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrust')) {
     if (-not $Force) {
-        $isProjectRoot = (Test-Path '.git') -or (Test-Path 'package.json') -or `
-                         (Test-Path '*.sln') -or (Test-Path '.mcp.json') -or `
-                         (Test-Path 'pyproject.toml') -or (Test-Path 'go.mod') -or `
-                         (Test-Path 'Cargo.toml')
-        if (-not $isProjectRoot) {
+        if (-not (Test-CwcInProjectRoot)) {
             Write-Host ""
             Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
             Write-Host "  cwc trust operates per-project -- cd to a project directory first."
@@ -719,12 +1494,15 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
         }
     }
     $slugForTrust = Get-ProjectSlug $projectDir
-    $cfgForTrust  = Read-CwcConfig
+    # Trust intentionally tolerates a missing project config: it's used in the main
+    # launcher flow before a config might exist (older cwc setup hasn't been run yet).
+    # Read returns $null -> Get-CwcProjectTrustState reports everything as untrusted.
+    $cfgForTrust  = Read-CwcProjectConfig $slugForTrust
 
     if ($Cmd[0] -eq 'untrust') {
-        if ($cfgForTrust.trusted_files -and $cfgForTrust.trusted_files.ContainsKey($slugForTrust)) {
-            $cfgForTrust.trusted_files.Remove($slugForTrust)
-            Write-CwcConfig $cfgForTrust
+        if ($cfgForTrust -and $cfgForTrust.trusted_files -and $cfgForTrust.trusted_files.Count -gt 0) {
+            $cfgForTrust.trusted_files = @{}
+            Write-CwcProjectConfig $slugForTrust $cfgForTrust
             Write-Host "Removed trust for project: $projectDir" -ForegroundColor Yellow
             Write-Host "  Next 'cwc' run will re-prompt for trust."
         } else {
@@ -735,7 +1513,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
 
     # cwc trust [list]
     $trustSub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { '' }
-    $state = Get-CwcProjectTrustState $cfgForTrust $slugForTrust $projectDir
+    $state = Get-CwcProjectTrustState $cfgForTrust $projectDir
     if ($trustSub -eq 'list') {
         Write-Host ""
         Write-Host "  Project: $projectDir" -ForegroundColor Cyan
@@ -752,7 +1530,7 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
     Write-Host ""
     Write-Host "  Trusting current state of:" -ForegroundColor Cyan
     Show-TrustState $state
-    Save-CwcProjectTrust $cfgForTrust $slugForTrust $projectDir | Out-Null
+    Save-CwcProjectTrust $slugForTrust $projectDir | Out-Null
     Write-Host ""
     Write-Host "  Trusted current state for: $projectDir" -ForegroundColor Green
     exit 0
@@ -770,29 +1548,37 @@ if ($Cmd -and $Cmd.Count -gt 0 -and ($Cmd[0] -eq 'trust' -or $Cmd[0] -eq 'untrus
 # and the limitations.
 if ($Cmd -and $Cmd.Count -gt 0 -and $Cmd[0] -eq 'harden') {
     $hardenSub = if ($Cmd.Count -ge 2) { $Cmd[1] } else { 'status' }
-    $cfgForHarden = Read-CwcConfig
+    if (-not (Test-CwcInProjectRoot)) {
+        Write-Host ""
+        Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
+        Write-Host "  cwc harden operates per-project -- cd to a project directory first."
+        Write-Host ""
+        exit 1
+    }
+    $slugForHarden = Get-ProjectSlug $projectDir
+    $cfgForHarden  = Get-RequiredCwcProjectConfig $slugForHarden $projectDir
     switch ($hardenSub) {
         'enable' {
             if ($cfgForHarden.harden_enabled) {
-                Write-Host "Harden already enabled." -ForegroundColor DarkGray
+                Write-Host "Harden already enabled for this project." -ForegroundColor DarkGray
                 exit 0
             }
             $cfgForHarden.harden_enabled = $true
-            Write-CwcConfig $cfgForHarden
+            Write-CwcProjectConfig $slugForHarden $cfgForHarden
             Write-Host ""
-            Write-Host "Harden enabled." -ForegroundColor Green
-            Write-Host "  Next 'cwc' session will run with the in-container watchdog active."
+            Write-Host "Harden enabled for this project." -ForegroundColor Green
+            Write-Host "  Next 'cwc' session in $projectDir will run with the in-container watchdog active."
             Write-Host "  See 'cwc harden status' for what gets enforced."
             Write-Host ""
         }
         'disable' {
             if (-not $cfgForHarden.harden_enabled) {
-                Write-Host "Harden already disabled." -ForegroundColor DarkGray
+                Write-Host "Harden already disabled for this project." -ForegroundColor DarkGray
                 exit 0
             }
             $cfgForHarden.harden_enabled = $false
-            Write-CwcConfig $cfgForHarden
-            Write-Host "Harden disabled. Next 'cwc' session will run without the watchdog." -ForegroundColor Yellow
+            Write-CwcProjectConfig $slugForHarden $cfgForHarden
+            Write-Host "Harden disabled for this project. Next 'cwc' session will run without the watchdog." -ForegroundColor Yellow
         }
         'status' {
             $state = if ($cfgForHarden.harden_enabled) { 'ENABLED' } else { 'disabled' }
@@ -879,11 +1665,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 
 # Project-root heuristic: looks like a real project unless -Force.
 if (-not $Force) {
-    $isProjectRoot = (Test-Path '.git') -or (Test-Path 'package.json') -or `
-                     (Test-Path '*.sln') -or (Test-Path '.mcp.json') -or `
-                     (Test-Path 'pyproject.toml') -or (Test-Path 'go.mod') -or `
-                     (Test-Path 'Cargo.toml')
-    if (-not $isProjectRoot) {
+    if (-not (Test-CwcInProjectRoot)) {
         Write-Host ""
         Write-Host "  '$projectDir' doesn't look like a project root." -ForegroundColor Yellow
         Write-Host "  (no .git, package.json, .sln, .mcp.json, pyproject.toml, go.mod, Cargo.toml)"
@@ -908,11 +1690,36 @@ foreach ($dir in @($authDir, $cfgDir, $histDir)) {
     }
 }
 
-# 2b. Trust check -- workspace files that drive next-session policy
-# (claude-sandbox.overlay.yml, .env, .mcp.json). The agent has RW in the workspace,
-# so any of these can be agent-edited; we refuse to silently inherit those edits.
-$cwcCfg = Read-CwcConfig
-$trustState = Get-CwcProjectTrustState $cwcCfg $slug $projectDir
+# 2b. Per-project config + trust check.
+# First load the per-project config. If it doesn't exist, auto-trigger the setup
+# wizard inline (interactive sessions only) -- non-interactive sessions fail closed
+# with an actionable error.
+$cwcCfg = Read-CwcProjectConfig $slug
+if (-not $cwcCfg) {
+    if (-not (Test-CwcInteractive)) {
+        Write-Host ""
+        Write-Host "  No cwc config for this project, and this isn't an interactive session." -ForegroundColor Red
+        Write-Host "  Run 'cwc setup' from $projectDir from a real terminal first." -ForegroundColor DarkGray
+        Write-Host ""
+        exit 1
+    }
+    Write-Host ""
+    Write-Host "  First time using cwc in this project. Let's configure its sandbox." -ForegroundColor Cyan
+    Write-Host "  (You can re-run 'cwc setup' anytime to reconfigure.)" -ForegroundColor DarkGray
+    Write-Host ""
+    $saved = Invoke-CwcProjectSetup -ProjectDir $projectDir -Slug $slug
+    if (-not $saved) {
+        Write-Host "  Setup not saved -- aborting launch." -ForegroundColor Yellow
+        Write-Host "  Re-run 'cwc' (or 'cwc setup') when you're ready to configure."
+        exit 1
+    }
+    $cwcCfg = Read-CwcProjectConfig $slug
+}
+
+# Trust covers workspace files that drive next-session policy (claude-sandbox.overlay.yml,
+# .env, .mcp.json). The agent has RW in the workspace, so any of these can be agent-edited;
+# we refuse to silently inherit those edits.
+$trustState = Get-CwcProjectTrustState $cwcCfg $projectDir
 if ($trustState.any_changed) {
     Write-Host ""
     Write-Host "  Trust check: workspace policy files have changed" -ForegroundColor Yellow
@@ -934,7 +1741,7 @@ if ($trustState.any_changed) {
         Write-Host "  Cancelled." -ForegroundColor DarkGray
         exit 1
     }
-    Save-CwcProjectTrust $cwcCfg $slug $projectDir | Out-Null
+    Save-CwcProjectTrust $slug $projectDir | Out-Null
     Write-Host "  Saved trust for this project." -ForegroundColor Green
     Write-Host ""
 }
@@ -963,8 +1770,8 @@ $env:CLAUDE_STATE_CONFIG  = $cfgDir
 $env:CLAUDE_STATE_HISTORY = $histDir
 $env:CLAUDE_STATE_AUTH    = $authDir
 
-# 4a. Apply user config (~/.cwc/config.json) to the firewall env vars.
-# Config was already read above for the trust check; reuse it. The user config is
+# 4a. Apply per-project config (~/.cwc/projects/<slug>/config.json) to the firewall env vars.
+# Config was already read above for the trust check; reuse it. Per-project config is
 # the only source for CWC_* values now -- project .env can no longer drive them
 # (Phase 2 of the security plan; see docs/security.md).
 if (-not $env:CWC_LOCKDOWN_LAN) {
@@ -996,18 +1803,6 @@ if (@($cwcCfg.extra_hosts.Keys).Count -gt 0) {
     $env:CWC_EXTRA_HOSTS = $pairs -join ';'
 }
 
-# One-time migration banner -- printed on the first session after upgrading from the
-# pre-Phase-4 schema (bare-string targets, no per-port restriction). Re-saving the
-# config in new format dismisses the banner permanently.
-if ($script:cwcMigratedHostPorts) {
-    Write-Host ""
-    Write-Host "[cwc] Upgraded host-add entries to per-port schema (default ports 443,80)." -ForegroundColor Yellow
-    Write-Host "[cwc] Run 'cwc firewall host-list' to review; 'cwc firewall host-add <fqdn> <target> <ports>'" -ForegroundColor DarkGray
-    Write-Host "[cwc] to narrow further. Saving config in new format now." -ForegroundColor DarkGray
-    Write-Host ""
-    Write-CwcConfig $cwcCfg
-}
-
 # Build --volume flags for additional bind mounts (Obsidian vault, design specs, etc.).
 # Skips mounts whose source has gone missing -- warns but doesn't fail the session.
 $mountFlags = @()
@@ -1025,6 +1820,13 @@ if (@($cwcCfg.mounts.Keys).Count -gt 0) {
     }
 }
 
+# Append dev-mode extra mounts (e.g. live_entrypoint_mount). $script:cwcDevExtraMounts
+# is populated by the `cwc dev` subcommand block when a flag asks for an extra bind.
+# Empty in non-dev sessions -- this is a no-op then.
+if ($script:cwcDevExtraMounts -and $script:cwcDevExtraMounts.Count -gt 0) {
+    $mountFlags += $script:cwcDevExtraMounts
+}
+
 # 4b. Forward env vars from project's .env
 # Allowlist:
 #   - ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN  (auth -- used by Claude itself)
@@ -1035,8 +1837,9 @@ if (@($cwcCfg.mounts.Keys).Count -gt 0) {
 # CWC_* keys are NEVER read from project .env -- they're sandbox-control flags and the
 # agent has RW on the workspace, so allowing project .env to set them would let the
 # agent silently disable the lockdown / inject into the hosts file on the next launch.
-# Shell env CWC_* still works (one-shot dev override); user config (~/.cwc/config.json)
-# is the persistent source. (Phase 2 of the security plan; see docs/security.md.)
+# Shell env CWC_* still works (one-shot dev override); per-project config
+# (~/.cwc/projects/<slug>/config.json) is the persistent source. (Phase 2 of the
+# security plan; see docs/security.md.)
 function Read-DotEnv([string]$path) {
     $map = @{}
     if (-not (Test-Path $path)) { return $map }
@@ -1158,6 +1961,62 @@ if (-not $Cmd -or $Cmd.Count -eq 0) {
 }
 
 # 7. Print session summary
+# Lead with a one-line image banner so users always know which version they're
+# running and whether it's the latest stable. CWC_SKIP_VERSION_CHECK=1 disables
+# the network call (used in CI / offline / tests).
+$cwcClass = Get-CwcImageClassification $cwcImage
+$bannerColor = 'DarkGray'
+$bannerText  = $null
+switch ($cwcClass.kind) {
+    'dev' {
+        # The `cwc dev` block already prints its own [cwc dev] banner, so suppress
+        # this one to avoid double-banner noise.
+        $bannerText = $null
+    }
+    'latest-tag' {
+        $bannerText  = "[cwc] image: $cwcImage (latest stable)"
+        $bannerColor = 'Green'
+    }
+    'preview' {
+        $bannerText  = "[cwc] image: $cwcImage (preview / pre-release)"
+        $bannerColor = 'Magenta'
+    }
+    'stable' {
+        if ($env:CWC_SKIP_VERSION_CHECK -eq '1') {
+            $bannerText  = "[cwc] image: $cwcImage (stable; version-check skipped)"
+            $bannerColor = 'DarkGray'
+        } else {
+            $latestStable = Get-CwcLatestStableVersion
+            if (-not $latestStable) {
+                $bannerText  = "[cwc] image: $cwcImage (stable; version-check unavailable)"
+                $bannerColor = 'DarkGray'
+            } else {
+                $cur = [version]$cwcClass.version
+                $lat = [version]$latestStable
+                if ($cur -eq $lat) {
+                    $bannerText  = "[cwc] image: $cwcImage (stable, latest)"
+                    $bannerColor = 'Green'
+                } elseif ($cur -lt $lat) {
+                    $bannerText  = "[cwc] image: $cwcImage (stable, outdated -- $latestStable is available)"
+                    $bannerColor = 'Yellow'
+                } else {
+                    # Running ahead of the published latest -- typically during a release window.
+                    $bannerText  = "[cwc] image: $cwcImage (stable, ahead of published $latestStable)"
+                    $bannerColor = 'DarkGray'
+                }
+            }
+        }
+    }
+    'custom' {
+        $bannerText  = "[cwc] image: $cwcImage (custom tag)"
+        $bannerColor = 'DarkGray'
+    }
+}
+if ($bannerText) {
+    Write-Host ""
+    Write-Host $bannerText -ForegroundColor $bannerColor
+}
+
 Write-Host ""
 Write-Host "  Project   : $projectDir" -ForegroundColor DarkGray
 Write-Host "  State     : $projDir" -ForegroundColor DarkGray

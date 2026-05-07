@@ -4,8 +4,30 @@ All notable changes to this project will be documented in this file. Format foll
 
 ## [Unreleased]
 
+_Nothing yet. Open a feature branch off `main` and add entries here as you go._
+
+## [0.1.1] - 2026-05-07
+
+Major refactor of the per-project model + dev-mode tooling. Includes breaking changes to the config layout (no migration — re-run `cwc setup` per project) and to the install URL (now points at GitHub release assets instead of a branch). The image tag scheme is unchanged.
+
+### Added
+
+- **`cwc setup` subcommand** for per-project sandbox configuration. Walks 6 questions (LAN subnets, host services + ports + canonical `host` alias, custom FQDN→IP, folder mounts, harden) and writes `~/.cwc/projects/<slug>/config.json`. The first time you run `cwc` in a project, it auto-triggers this wizard inline (interactive sessions only) — non-interactive sessions fail closed with a "run `cwc setup` first" message. Re-run `cwc setup` anytime to reconfigure.
+- **Canonical `host` hostname for host-machine services.** Q3 of the wizard now asks for a comma-separated TCP port list and always registers `host` → `host-gateway` with those ports. Inside the container, agents reach host services as `http://host:<port>`. Optional extra hostnames (e.g. `api.test`, `dev.local`) share the same port list.
+- **`cwc dev` session-scoped dev mode.** Runs against a local `:dev` image (built from the Dockerfile next to `cwc.ps1`) for just that invocation; leaving puts you back in normal mode. Management subcommands: `cwc dev build`, `cwc dev rebuild` (no-cache), `cwc dev clean`, `cwc dev status`. Persistent flag store at `~/.cwc/dev.json`: `cwc dev flag {list|set|unset}`. The first flag, `live_entrypoint_mount`, bind-mounts the clone's `entrypoint.ps1` over `C:\entrypoint.ps1` inside the container — edits take effect on the next `cwc dev` with no rebuild. Requires running from a clone (Dockerfile must be next to cwc.ps1). Refuses host-side wrappers (`cwc dev firewall`, etc.) since they don't start a container.
+- **Launch banner with version + freshness.** Every `cwc` launch now prints a one-line `[cwc] image: <tag> (<state>)` banner before the session summary. States: `latest stable` (`:latest` or matches GitHub's most recent release), `stable, latest`, `stable, outdated -- X.Y.Z is available`, `preview / pre-release`, `custom tag`. The freshness check hits `api.github.com/repos/.../releases/latest` and caches the result at `~/.cwc/version-cache.json` for 24h, so most launches don't make a network call. Set `CWC_SKIP_VERSION_CHECK=1` to disable the check (CI / offline). Dev sessions print their own `[cwc dev] running with ...` banner instead.
+- **Project-isolation tests** (`tests/project-isolation.tests.ps1`) verify firewall allows, extra_hosts, and harden settings in project A do NOT leak into project B.
+- **Dev tests** (`tests/dev.tests.ps1`) cover flag list/set/unset persistence, status output, host-side wrapping rejection.
+
 ### Changed
 
+- **Per-project sandbox config (BREAKING).** Sandbox state is now split:
+  - `~/.cwc/config.json` holds **only** global security policy: `host_denylist` and a `defaults` block.
+  - `~/.cwc/projects/<slug>/config.json` holds everything else: `lockdown_lan`, `harden_enabled`, `allow_nets`, `extra_hosts`, `mounts`, `trusted_files`. `<slug>` is the existing project-slug formula (SHA-1 of absolute path, basename-prefixed, 12 hex chars), already used for `~/.claude-win-container/state/<slug>/`.
+
+  All per-project subcommands (`cwc firewall {list, allow, deny, host-add, host-remove}`, `cwc mount`, `cwc harden`, `cwc trust`, `cwc untrust`) now read/write the per-project file. `cwc firewall denylist {list, add, remove, reset}` stays global. Outside a project root, per-project subcommands refuse with an actionable error. **This is a breaking change** — existing global configs from 0.1.0-alpha do NOT auto-migrate. Re-run `cwc setup` in each project. Trust state moves with each project (no longer slug-keyed in a global map).
+
+- **Install wizard removed.** `install.ps1` is now a minimal one-shot: security primer → file download → `$PROFILE` alias. All firewall / mount / host-services configuration moved to `cwc setup`, which runs per-project. The `-SkipFirewallSetup` flag is gone (no firewall wizard at install time).
 - **Install command moved to GitHub release assets.** The bootstrap URL is now `https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1` (was `raw.githubusercontent.com/.../main/install.ps1`). `releases/latest` always redirects to the most recent stable release and skips `preview/*` prereleases, so new installs are decoupled from `main`'s state — no more "install fails because `main` is between releases." `install.ps1`, `cwc.ps1`, `docker-compose.yml`, and `project-overlay.example.yml` are now uploaded as release assets by the build workflow. **This is a breaking change** for anyone who scripted the old `raw.githubusercontent.com` URL; update bookmarks. Branch-ref installs (`-Ref main`, `-Ref release/x.y.z`) still work via the raw URL fallback for development.
 - **`install.ps1` default `-Ref` changed from `main` to `latest`.** With `latest`, peer files are fetched from the same `releases/latest/download/` redirect. Tags (`-Ref v1.2.3`) pull from that release's assets. Branch refs continue to resolve through `raw.githubusercontent.com`.
 

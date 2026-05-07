@@ -55,6 +55,12 @@ $script:cwcManagedEnvVars = @(
     'CLAUDE_STATE_AUTH'
 )
 
+# Tests should never hit the GitHub releases API for the launch banner's "is this
+# the latest stable?" check -- it's slow and rate-limited. The launcher honors
+# CWC_SKIP_VERSION_CHECK=1 to bypass it, which we set globally for the duration
+# of the test run.
+$env:CWC_SKIP_VERSION_CHECK = '1'
+
 # Run a PowerShell command inside a one-shot cwc container. Working dir on the host
 # determines what gets bind-mounted as the workspace; defaults to the suite's fixture.
 # -Env lets tests deliberately set CWC_* vars to test env-driven overrides (those are
@@ -100,10 +106,33 @@ function Invoke-InContainer {
     return ($cleaned -join "`n")
 }
 
-# Write ~/.cwc/config.json with the given values. Replaces any existing config.
-# Accepts ExtraHosts in either old format ({fqdn -> '<target-string>'}) or new
-# Phase-4 format ({fqdn -> @{target=...; ports=@(...)}}); old-format strings are
-# auto-promoted to {target, ports=@(443,80)} so older tests stay readable.
+# Mirror of cwc.ps1's Get-ProjectSlug. Tests need to compute the per-project config
+# path the same way the launcher does, so we duplicate the formula here.
+function Get-CwcSlugForTest([string]$path) {
+    $abs = (Resolve-Path $path).Path.ToLowerInvariant()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($abs)
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    $hash = $sha1.ComputeHash($bytes)
+    $sha1.Dispose()
+    $hex = [System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    $base = Split-Path -Leaf $abs
+    $base = ($base -replace '[^a-z0-9._-]', '-')
+    return "$base-$($hex.Substring(0,12))"
+}
+
+# Seed the test environment with both the global config (~/.cwc/config.json) and
+# a per-project config (~/.cwc/projects/<slug>/config.json) for the project
+# directory specified by -ProjectDir.
+#
+# Default -ProjectDir is $script:fixtures.workspace -- the dir Invoke-InContainer
+# runs from -- so container-side tests don't need to pass it. Host-side tests that
+# operate on a different fixture project (project-isolation, setup) pass it
+# explicitly.
+#
+# Replaces both files in full each call -- no merge with existing.
+# Accepts ExtraHosts in either old bare-string format ({fqdn -> '<target>'}) or
+# the {fqdn -> @{target, ports}} format; old-format strings are auto-promoted
+# to {target, ports=@(443,80)} so older tests stay readable.
 function Set-CwcConfig {
     param(
         [bool]$LockdownLan = $true,
@@ -112,8 +141,12 @@ function Set-CwcConfig {
         [hashtable]$Mounts = @{},
         [string[]]$HostDenylist = $null,
         [bool]$HardenEnabled = $false,
-        [hashtable]$TrustedFiles = $null
+        [hashtable]$TrustedFiles = $null,
+        [string]$ProjectDir = $null
     )
+    if (-not $ProjectDir) {
+        $ProjectDir = if ($script:fixtures -and $script:fixtures.workspace) { $script:fixtures.workspace } else { $PWD.Path }
+    }
     $hostsOut = @{}
     foreach ($k in $ExtraHosts.Keys) {
         $v = $ExtraHosts[$k]
@@ -132,31 +165,56 @@ function Set-CwcConfig {
         )
     }
     if ($null -eq $TrustedFiles) { $TrustedFiles = @{} }
-    $cfg = @{
+
+    # Global: only security policy lives here.
+    $globalCfg = @{
+        host_denylist = @($HostDenylist)
+        defaults      = @{
+            lockdown_lan   = $true
+            harden_enabled = $false
+        }
+    }
+    $globalPath = Join-Path $env:USERPROFILE '.cwc\config.json'
+    $globalDir  = Split-Path -Parent $globalPath
+    if (-not (Test-Path $globalDir)) { New-Item -ItemType Directory -Force -Path $globalDir | Out-Null }
+    $globalCfg | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $globalPath
+
+    # Per-project: everything else, keyed by project slug.
+    $abs  = (Resolve-Path $ProjectDir).Path
+    $slug = Get-CwcSlugForTest $abs
+    $projDir  = Join-Path $env:USERPROFILE ".cwc\projects\$slug"
+    $projPath = Join-Path $projDir 'config.json'
+    if (-not (Test-Path $projDir)) { New-Item -ItemType Directory -Force -Path $projDir | Out-Null }
+    $projCfg = @{
+        project_path   = $abs
+        project_name   = Split-Path -Leaf $abs
         lockdown_lan   = $LockdownLan
+        harden_enabled = $HardenEnabled
         allow_nets     = @($AllowNets)
         extra_hosts    = $hostsOut
         mounts         = $Mounts
-        host_denylist  = @($HostDenylist)
-        harden_enabled = $HardenEnabled
         trusted_files  = $TrustedFiles
     }
-    $path = Join-Path $env:USERPROFILE '.cwc\config.json'
-    $dir  = Split-Path -Parent $path
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path
+    $projCfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $projPath
 }
 
 # Run a cwc subcommand on the HOST (not inside a container). Used for tests of
 # host-side commands like 'cwc firewall host-add', 'cwc trust', 'cwc harden status'
 # where the behaviour we're checking lives in cwc.ps1 itself, not in the container.
 # Returns a hashtable: @{ ExitCode = <int>; Output = <string> }.
+#
+# Default -WorkDir is the fixture workspace (mirrors Invoke-InContainer). This
+# makes Set-CwcConfig's default project (also fixture workspace) line up with
+# where cwc.ps1 looks up the per-project config.
 function Invoke-CwcOnHost {
     param(
         [Parameter(Mandatory)] [string[]]$Args,
         [string]$WorkDir = $null
     )
-    if ($WorkDir) { Push-Location $WorkDir }
+    if (-not $WorkDir) {
+        $WorkDir = if ($script:fixtures -and $script:fixtures.workspace) { $script:fixtures.workspace } else { $PWD.Path }
+    }
+    Push-Location $WorkDir
     try {
         # *>&1 captures ALL streams (stdout, stderr, warning, verbose, debug,
         # information). cwc.ps1 prints user-facing output via Write-Host, which
@@ -168,7 +226,7 @@ function Invoke-CwcOnHost {
             Output   = ($raw | Out-String)
         }
     } finally {
-        if ($WorkDir) { Pop-Location }
+        Pop-Location
     }
 }
 

@@ -87,9 +87,45 @@ Each of these is a deliberate, multi-step act. The realistic threat (claude tool
 
 For real isolation, the answer is host-side enforcement — see [Future work](#future-work-host-side-enforcement).
 
+## `cwc dev` and the threat model
+
+`cwc dev` runs against a local `:dev` image built from the Dockerfile next to `cwc.ps1`. It's a developer-iteration tool, not a hardened path — the threat model assumes a **trusted dev environment**:
+
+- **Requires a clone.** Dev mode refuses without a Dockerfile next to the launcher. The published install (`~/.cwc/`) drops only the launcher files, so end-user installs can't enter dev mode by accident.
+- **Session-scoped.** Each `cwc dev` invocation explicitly opts in. There's no persistent "always-dev" toggle that could survive a reboot or shell restart unnoticed.
+- **Host-side flag store.** `~/.cwc/dev.json` lives outside the workspace, like the other cwc config files. The agent in the container can't see or modify it.
+
+### `live_entrypoint_mount` flag
+
+When the `live_entrypoint_mount` dev flag is on, `cwc dev` bind-mounts the clone's `entrypoint.ps1` over `C:\entrypoint.ps1` inside the container, **read-only**. This lets you iterate on entrypoint behavior without rebuilding the image — the new file takes effect on next launch.
+
+**Threat-model implications:**
+
+- The mounted file is read-only inside the container — the agent can't modify it during a session.
+- The host source is the clone's `entrypoint.ps1`, which sits in the developer's working tree. If the agent (or anything else) modifies the host file between `cwc dev` invocations, the next launch picks up the modified version. **The trust system protects workspace files inside the project; it does NOT cover files in the cwc clone itself.**
+- The clone is *not* mounted as a workspace. The agent only sees the project workspace (as usual) plus the bind-mounted entrypoint file at the container's system path. There's no path from a session to "edit my own entrypoint and persist it."
+- This flag is therefore safe to leave on during routine dev work, but if you're using `cwc dev` to *test* whether the baked-in image is correct, turn it off so you're testing the actual image.
+
+The flag is off by default. Turning it on is an explicit `cwc dev flag set live_entrypoint_mount on` — banner text on every dev session shows when it's active so you can't forget.
+
 ## Cross-project state
 
-`~/.cwc/config.json` (firewall config, trust hashes, harden state) is global to your machine.
+### Sandbox config split: global vs per-project
+
+Sandbox configuration is split across two files to balance "user can never accidentally weaken security policy" against "every project gets only the access it needs":
+
+| File | Scope | Holds |
+| --- | --- | --- |
+| `~/.cwc/config.json` | **Global** | `host_denylist` (FQDNs `cwc firewall host-add` refuses), `defaults` block (system-wide defaults applied when a project doesn't override). |
+| `~/.cwc/projects/<slug>/config.json` | **Per-project** | `lockdown_lan`, `harden_enabled`, `allow_nets`, `extra_hosts`, `mounts`, `trusted_files`. `<slug>` = SHA-1 of the project's absolute path, basename-prefixed (12 hex chars). |
+
+**Why this matters for the threat model.** Both files live outside the workspace (under `~/.cwc/`, which is *not* bind-mounted into the container). The agent has no path to read or modify them. So per-project config doesn't change the agent threat model — it just narrows what each project's sandbox does, so an unrelated project's allowed CIDRs / open host ports / mounted folders aren't leaked into this session.
+
+**Why the denylist stays global.** The denylist is what stops any project from mapping `*.anthropic.com` to a hosts-file injection target. If it were per-project, a misconfigured project (or a user accidentally running `denylist remove` once) would leave one project unprotected. Global means the protection is uniform.
+
+Per-project config is created by `cwc setup`. The first time you run `cwc` in a project that has no config, the wizard auto-triggers (interactive sessions only). Re-run `cwc setup` to reconfigure.
+
+### Per-project state directories
 
 `~/.claude-win-container/auth/` is shared across all projects' sessions. It holds:
 - `.credentials.json` — OAuth tokens. Needed across projects so you don't re-auth on each `cd`.

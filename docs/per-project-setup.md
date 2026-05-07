@@ -1,14 +1,29 @@
 # Per-project setup
 
-What a project repo needs (or doesn't) to opt into the sandboxed Claude container. The launcher (`cwc.ps1`) is invoked from the **project's** working directory, not from this repo.
+What a project repo needs (or doesn't) to opt into the sandboxed Claude container, plus the per-project sandbox config that `cwc setup` writes outside the repo. The launcher (`cwc.ps1`) is invoked from the **project's** working directory, not from this repo.
 
-## Required: nothing
+## First-time setup: `cwc setup`
 
-If your project root contains any of `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml`, the launcher will accept it as a project root and run. No files in your repo need to change.
+The first time you run `cwc` in a project, an interactive wizard auto-triggers and writes per-project sandbox config to `~/.cwc/projects/<slug>/config.json` (host-side, outside the workspace — the agent can't see or modify it). You can also run `cwc setup` explicitly to reconfigure later.
+
+The wizard asks 6 questions:
+
+1. (informational) Public internet — always allowed.
+2. **LAN subnets** — CIDRs to allow through the lockdown (e.g. `192.168.1.0/24`).
+3. **Host-machine services** — comma-separated TCP ports. The hostname `host` is always registered to point at the Docker host's vNIC, with the listed ports opened. The agent reaches services as `http://host:<port>`. Optional extra hostnames share the same port list.
+4. **Custom FQDN → IP mappings** — explicit hostname-to-IP for things that aren't your Docker host.
+5. **Folder mounts** — additional bind mounts from your host into `C:\docs\<name>` (RO by default).
+6. **Harden** — toggle the in-container watchdog for this project. Recommended: ON.
+
+Each project's config is independent. A port opened in project A is NOT visible from project B. The sole exception is `cwc firewall denylist`, which is global (security policy applied everywhere).
+
+## Required: nothing in the repo itself
+
+If your project root contains any of `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml`, the launcher will accept it as a project root and run. No files in your repo need to change for the basic flow.
 
 ```powershell
 cd C:\Users\you\Projects\my-app
-cwc                       # boots Claude in a sandboxed container, mounts the repo at C:\workspace
+cwc                       # first run: triggers `cwc setup`, then boots Claude in a sandboxed container
 ```
 
 ## Optional: `.mcp.json`
@@ -108,7 +123,7 @@ Three files in your project root drive what flows into the next session:
 
 The agent has RW on the workspace, which means it can edit any of these files. Without something stopping it, the agent could silently expand its next session's sandbox by editing the workspace.
 
-The trust system tracks per-project SHA-256 of these three files in `~/.cwc/config.json` under `trusted_files["<project-slug>"]`. Before launching the container, the launcher checks each tracked file's hash against what was stored last time you ran `cwc trust`. The behaviour on mismatch:
+The trust system tracks per-project SHA-256 of these three files in the project's config at `~/.cwc/projects/<slug>/config.json` under `trusted_files`. Before launching the container, the launcher checks each tracked file's hash against what was stored last time you ran `cwc trust`. The behaviour on mismatch:
 
 - **Interactive session** (real terminal): the launcher shows per-file status (`trusted` / `NEW` / `MODIFIED` / `DELETED`) and prompts `Trust current state and continue? [y/N]`. Answering `y` saves the new hashes and proceeds.
 - **Non-interactive session** (CI, scripted, redirected stdin): the launcher refuses to launch with a clear `Run 'cwc trust' to acknowledge` message. No silent inheritance.

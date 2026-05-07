@@ -181,8 +181,21 @@ The full pipeline lives in [`.github/workflows/build-and-release.yml`](../.githu
 | `lint` | every run, after `classify` | `PSScriptAnalyzer` on all `.ps1`/`.psm1`/`.psd1` files. Errors block; warnings surface but pass. |
 | `test-host` | every run, after `classify` | Runs `tests/run.ps1 -Filter 'denylist\|trust'` on a windows-latest runner. Host-only test subset, no Docker required. ~30s. |
 | `build` (matrix × 2) | every run, after `lint` + `test-host` | `docker build` for `ltsc2019` + `ltsc2022`; smoke-tests each. On `is_publishable` (release or preview), pushes the version-tagged images. On `is_release` (release only), additionally pushes the `latest` aliases. |
-| `release` | when `is_publishable`, after `build` | Extracts the matching CHANGELOG section, generates an image table + quickstart, creates the GitHub release with tag `v<semver>`. For preview branches, marks the release as a pre-release and prepends a banner. |
+| `release` | when `is_publishable`, after `build` | Extracts the matching CHANGELOG section, generates an image table + quickstart, creates the GitHub release with tag `v<semver>`, and uploads the launcher files as release assets (see below). For preview branches, marks the release as a pre-release and prepends a banner. |
 | `post-release-pr` | when `is_release` (release only), after `release` | Opens a PR from the release branch to `main`. Idempotent — if a PR is already open for this branch, leaves it alone. |
+
+### Release assets
+
+The `release` job attaches four files as assets to every release (preview and stable alike):
+
+- `install.ps1`
+- `cwc.ps1`
+- `docker-compose.yml`
+- `project-overlay.example.yml` (uploaded flat — the in-repo path is `overlays/project-overlay.example.yml`)
+
+These assets are what makes the install URL — `https://github.com/<owner>/<repo>/releases/latest/download/install.ps1` — work. GitHub's `releases/latest` redirect resolves to the most recent **non-prerelease** release, so users running the standard install command always get the latest stable launcher; preview releases are automatically skipped. Pinned installs (`-Ref v1.2.3`) and preview installs (`-Ref v1.2.3-rc.1`) read from the same per-release asset namespace.
+
+If you change which files `install.ps1` downloads, update the `files:` list on the `softprops/action-gh-release@v2` step in the workflow to match. The asset namespace is flat (no directories) — if you add a file from a subdirectory, GitHub uploads it under just its basename.
 
 Container-side tests (`network`, `settings-merge`, `harden`) are deliberately not in CI — they each spin up a real container, take ~20s each, and the matrix would multiply that. Run them locally with `.\tests\run.ps1 -Build` when iterating on `entrypoint.ps1`.
 
