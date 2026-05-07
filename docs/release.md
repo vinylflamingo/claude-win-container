@@ -15,13 +15,29 @@ How to cut a release of `claude-win-container`. Maintainer-facing — not releva
 
 ### How preview differs from release
 
-Same publishing pipeline; three deliberate differences:
+**Preview tags are SHA-suffixed and live in their own namespace; release tags are plain semver.** A `preview/0.1.1` branch and a later `release/0.1.1` branch produce **different** Docker tags and **different** GitHub releases — they don't collide, and any number of preview builds can ship for the same `x.y.z` without clobbering each other.
 
-1. **Preview pushes the version-tagged images** (`fcostoya/claude-win-container:1.0.1-rc.1`, `…-ltsc2019`, `…-ltsc2022`) **but not `latest`/`latest-ltsc2019`/`latest-ltsc2022`.** Those always point to the most recent stable release.
-2. **Preview creates a GitHub *pre-release*** (yellow "Pre-release" badge, excluded from "Latest release" on the repo page).
-3. **Preview does not auto-PR to `main`.** Validation only — promotion to `main` happens through `release/*`.
+| | `preview/<version>` (push at commit `<sha>`) | `release/<version>` |
+| --- | --- | --- |
+| Effective version | `<version>.<sha-first-6>` (e.g. `0.1.1.d9cd72`) | `<version>` (e.g. `0.1.1`) |
+| Docker tags pushed (SHA-pinned, preserved per build) | `:0.1.1.d9cd72`, `:0.1.1.d9cd72-ltsc2019`, `:0.1.1.d9cd72-ltsc2022` | `:0.1.1`, `:0.1.1-ltsc2019`, `:0.1.1-ltsc2022` |
+| Docker moving pointer (overwritten each push) | `:preview`, `:preview-ltsc2019`, `:preview-ltsc2022` | `:latest`, `:latest-ltsc2019`, `:latest-ltsc2022` |
+| GitHub release tag | `preview` (literal string; single moving release, upserted) | `v0.1.1` (one release per version, preserved) |
+| Marked as Pre-release on GitHub | **yes** | no |
+| Auto-PR to `main` | no | yes |
 
-Use preview when you want to push the same flow end-to-end (Docker login, image push, GitHub release creation) without committing to a stable version. Once you're satisfied a preview build is good, cut a `release/*` branch and promote.
+The asymmetry is deliberate:
+
+- **Stable releases are immutable historical artifacts.** Once `v0.1.1` ships, that exact tag never changes. Each version gets its own GitHub release entry and `:<version>` Docker tag, both preserved.
+- **Preview builds are unstable churn.** During QA you may push `preview/0.1.1` half a dozen times — each commit gets a SHA-pinned Docker tag (`:0.1.1.d9cd72`, `:0.1.1.4abc12`, ...) so testers can pin to an exact known build, but the GitHub release is a single moving target (literal tag `preview`, upserted via `softprops/action-gh-release@v2`) and the `:preview` Docker tag also moves. That keeps the install URL `releases/download/preview/install.ps1` stable while preview builds churn underneath.
+
+Typical flow:
+
+1. Push `preview/0.1.1` (commit `d9cd72ab...`) → CI builds + smoke-tests. Pushes `:0.1.1.d9cd72`/`-ltsc*` SHA-pinned tags. Updates `:preview`/`-ltsc*` to point at this build. Upserts the `preview` GitHub release: title `Preview 0.1.1.d9cd72`, marked pre-release, assets attached.
+2. QA finds an issue, fix, push `preview/0.1.1` again at a new commit → same flow, new SHA-pinned tag (`:0.1.1.4abc12`), `:preview` and the GitHub release move forward. Old SHA-pinned tag stays on Docker Hub.
+3. When ready, push `release/0.1.1` → CI publishes `:0.1.1`, `:0.1.1-ltsc*`, updates `:latest`/`-ltsc*`, creates a separate GitHub release `v0.1.1` (no pre-release flag), opens auto-PR to `main`. The `preview` release is unaffected — it still points at whatever the last preview build was, in case anyone is testing future-version previews.
+
+Anyone running `:preview` or `:0.1.1.d9cd72`-pinned during step 2 doesn't get auto-promoted to the stable release — they have to opt in (pull `:0.1.1` or `:latest`).
 
 ## One-time setup
 
@@ -67,35 +83,37 @@ Without this, the auto-PR step will fail with a 403.
 Push a `preview/*` branch and watch the workflow at <https://github.com/vinylflamingo/claude-win-container/actions>:
 
 ```powershell
-git checkout -b preview/0.0.1-test.1
-git push -u origin preview/0.0.1-test.1
+git checkout -b preview/0.0.1
+git push -u origin preview/0.0.1
 ```
 
 Expected sequence (about 12–15 minutes):
 
 ```text
-Classify branch        → green (kind=preview)
+Classify branch        → green (kind=preview, version=0.0.1.<sha>)
 Lint PowerShell        → green
 Host-side tests        → green
-Build (ltsc2019)       → green, including push (no `latest`)
-Build (ltsc2022)       → green, including push (no `latest`)
-Create GitHub release  → green (creates v0.0.1-test.1 as a pre-release)
+Build (ltsc2019)       → green, including push (SHA-pinned + :preview, no :latest)
+Build (ltsc2022)       → green, including push (SHA-pinned + :preview-ltsc2022, no :latest-ltsc2022)
+Create GitHub release  → green (upserts the `preview` release as pre-release)
 Open PR to main        → not run (gated on is_release, not just is_publishable)
 ```
 
 After it finishes:
 
-- <https://hub.docker.com/r/fcostoya/claude-win-container/tags> should show the new `0.0.1-test.1` tags.
-- <https://github.com/vinylflamingo/claude-win-container/releases> should show a yellow-badged "v0.0.1-test.1" pre-release.
+- <https://hub.docker.com/r/fcostoya/claude-win-container/tags> should show:
+  - SHA-pinned tags `0.0.1.<sha>`, `0.0.1.<sha>-ltsc2019`, `0.0.1.<sha>-ltsc2022`
+  - Moving tags `preview`, `preview-ltsc2019`, `preview-ltsc2022`
+- <https://github.com/vinylflamingo/claude-win-container/releases> should show a yellow-badged release titled "Preview 0.0.1.<sha>" with the literal git tag `preview`.
 
-Once verified, you can delete the preview branch and the pre-release/Docker tags by hand — they're disposable.
+Once verified, you can delete the preview branch and the SHA-pinned Docker tags by hand — they're disposable. The `:preview` tag and `preview` GitHub release will get overwritten by the next preview push (yours or someone else's), so they don't need cleanup.
 
 ## Cutting a release
 
 ```text
                          ┌── optional, but recommended ──┐
-feature/foo  ──merge──→  preview/x.y.z-rc.1  ──merge──→  release/x.y.z  ──auto-PR──→  main
-                          (CI: full publish, pre-release)  (CI: full release)        (no CI)
+feature/foo  ──merge──→  preview/x.y.z  ──merge──→  release/x.y.z  ──auto-PR──→  main
+                         (each push: :x.y.z.<sha> + moving :preview, single moving GitHub release)  (one-time: :x.y.z + :latest, vx.y.z GitHub release)  (no CI)
 ```
 
 ### Step 1 — finalise the CHANGELOG
@@ -157,19 +175,26 @@ If you push to a `release/*` branch and the workflow fails partway through (say,
 
 ## Cutting a preview
 
-Same flow as a release, just on a `preview/*` branch:
+Same flow as a release, just on a `preview/*` branch with the version number you intend to ship as stable:
 
 ```powershell
-git checkout -b preview/1.2.3-rc.1
+git checkout -b preview/1.2.3
 # (commit whatever you want validated)
-git push -u origin preview/1.2.3-rc.1
+git push -u origin preview/1.2.3
 ```
 
-The workflow runs the full publish pipeline but produces a pre-release on GitHub and skips the `latest` tag updates. There's no auto-PR back to main.
+The workflow appends the first 6 characters of the commit SHA to the version (so `preview/1.2.3` at commit `d9cd72ab...` becomes effective version `1.2.3.d9cd72`). It then:
 
-Convention: use a semver pre-release suffix (`1.2.3-rc.1`, `1.2.3-beta.2`, `2.0.0-alpha`) so the resulting tags compose cleanly with eventual releases. Ad-hoc names work too (`preview/test-the-pipeline`) — the workflow sanitises them for Docker tag rules — but you'll end up with messier tags like `vtest-the-pipeline` on GitHub.
+1. Builds + smoke-tests both base images.
+2. Pushes SHA-pinned Docker tags: `:1.2.3.d9cd72`, `:1.2.3.d9cd72-ltsc2019`, `:1.2.3.d9cd72-ltsc2022`. Each preview build gets its own pinned tag, preserved on Docker Hub.
+3. Pushes the moving `:preview` / `:preview-ltsc2019` / `:preview-ltsc2022` tags so users can pull "the latest preview" without knowing the SHA.
+4. Upserts the single `preview` GitHub release (literal tag string `preview`): title becomes `Preview 1.2.3.d9cd72`, marked pre-release, assets attached. Older preview release content gets replaced — only the most recent preview is "the" preview release at any given time.
 
-You can push to the same preview branch repeatedly; each push runs the pipeline and creates a new pre-release. Older preview tags stick around on Docker Hub until you delete them by hand. Clean up periodically — preview images aren't free.
+Skips: `:latest` Docker tags (those are stable-only), and there's no auto-PR back to `main`.
+
+**Multiple preview pushes are expected.** During QA you may iterate `preview/1.2.3` half a dozen times — each commit gets its own SHA-pinned tag (no clobber), and the moving pointers (`:preview`, the `preview` GitHub release) advance with each push. Testers who want to reproduce a specific build pull the SHA-pinned tag (`:1.2.3.d9cd72`); testers who want "whatever the team is currently testing" pull `:preview` or use `-Ref preview` for the install command.
+
+**Ad-hoc preview names** (`preview/test-pipeline`, `preview/debug-foo`) still work — the workflow sanitises them for Docker tag rules — but the SHA gets appended too (`test-pipeline.d9cd72`), so they look ugly. Use them only for one-off pipeline debugging; the convention is plain `preview/<x.y.z>` matching the version you intend to ship.
 
 ## What the workflow does, step by step
 
@@ -193,7 +218,13 @@ The `release` job attaches four files as assets to every release (preview and st
 - `docker-compose.yml`
 - `project-overlay.example.yml` (uploaded flat — the in-repo path is `overlays/project-overlay.example.yml`)
 
-These assets are what makes the install URL — `https://github.com/<owner>/<repo>/releases/latest/download/install.ps1` — work. GitHub's `releases/latest` redirect resolves to the most recent **non-prerelease** release, so users running the standard install command always get the latest stable launcher; preview releases are automatically skipped. Pinned installs (`-Ref v1.2.3`) and preview installs (`-Ref v1.2.3-rc.1`) read from the same per-release asset namespace.
+These assets are what makes the install URLs work:
+
+- **Stable** (default) — `https://github.com/<owner>/<repo>/releases/latest/download/install.ps1`. GitHub's `releases/latest` redirect resolves to the most recent **non-prerelease** release, so users running the standard install command always get the latest stable launcher; preview releases are automatically skipped.
+- **Latest preview** — `https://github.com/<owner>/<repo>/releases/download/preview/install.ps1`. The literal tag `preview` is the moving GitHub pre-release that the workflow upserts on every preview push.
+- **Pinned to a specific stable** — `https://github.com/<owner>/<repo>/releases/download/v1.2.3/install.ps1` (`-Ref v1.2.3`).
+
+The release job uses different `tag_name` values for preview vs release: `preview` (literal) for previews, `v<version>` for releases. softprops upserts on the preview tag (so each preview push replaces the previous preview release content), and creates a new release per `v<version>` for stables (preserved historically).
 
 If you change which files `install.ps1` downloads, update the `files:` list on the `softprops/action-gh-release@v2` step in the workflow to match. The asset namespace is flat (no directories) — if you add a file from a subdirectory, GitHub uploads it under just its basename.
 

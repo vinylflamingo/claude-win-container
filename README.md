@@ -122,27 +122,38 @@ Or set it permanently in `$PROFILE` alongside the alias.
 
 ## Trying a preview release
 
-`preview/*` branches publish version-tagged Docker images and a GitHub *pre-release* — useful for trying changes before they ship as `:latest`. Preview tags never become `:latest`; you opt in by name.
+`preview/*` branches publish unstable builds for testing. Each push produces SHA-pinned Docker tags (`:0.1.1.d9cd72`) preserved historically, plus a moving `:preview` Docker tag and a single GitHub release with the literal tag `preview` — both always point at the most recent preview build. Preview tags never become `:latest`; you opt in by name.
 
-**See what's available**: <https://github.com/vinylflamingo/claude-win-container/releases> shows pre-releases with a yellow "Pre-release" badge and an explicit `v<version>-rc.N` tag.
+**See what's available**: <https://github.com/vinylflamingo/claude-win-container/releases> — the `preview` release at the top of the list is the most recent build; its name shows the version + commit SHA (e.g. `Preview 0.1.1.d9cd72`).
 
-**Just the docker image** (keeps your installed `cwc.ps1` / `docker-compose.yml`):
+**Just the docker image — always latest preview** (keeps your installed `cwc.ps1` / `docker-compose.yml`):
 
 ```powershell
-$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1-rc.1'
+$env:CWC_IMAGE = 'fcostoya/claude-win-container:preview'
 cwc
 ```
 
-Unset to go back to the stable release: `Remove-Item Env:CWC_IMAGE`.
+Unset to go back to the latest stable: `Remove-Item Env:CWC_IMAGE`.
 
-**Full install from a preview** (pulls the preview's `install.ps1`, `cwc.ps1`, `docker-compose.yml` instead of the latest stable's):
+**Just the docker image — pinned to a specific preview build** (when you want exactly one build, not whatever `:preview` currently points at):
 
 ```powershell
-$args = @('-Ref','v0.1.1-rc.1')
-irm https://github.com/vinylflamingo/claude-win-container/releases/download/v0.1.1-rc.1/install.ps1 | iex
+$env:CWC_IMAGE = 'fcostoya/claude-win-container:0.1.1.d9cd72'
+cwc
 ```
 
-This overwrites `~/.cwc/` with the preview's launcher files. To go back to stable, re-run the normal install command (it pulls from `releases/latest/download/` which always points to the most recent **stable** release; preview releases are skipped).
+The SHA-pinned tags stay around indefinitely on Docker Hub — useful for reproducing a specific QA result.
+
+**Full install from the latest preview** (pulls the preview's `install.ps1`, `cwc.ps1`, `docker-compose.yml` instead of the latest stable's):
+
+```powershell
+$args = @('-Ref','preview')
+irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1 | iex
+```
+
+This overwrites `~/.cwc/` with the preview's launcher files. To go back to the latest stable, re-run the normal install command — it pulls from `releases/latest/download/`, which always resolves to the most recent **non-prerelease** release; pre-releases are skipped automatically.
+
+When the version under preview eventually ships as a stable release (same version number, e.g. `v0.1.1`), it gets a separate stable release entry and Docker tags (`:0.1.1`, `:latest`). The `preview` release stays around but stops being relevant for that version; the next preview push (for a future version) overwrites it.
 
 ## Working on cwc itself: `cwc dev`
 
@@ -171,6 +182,42 @@ docker compose build              # ~5-10 min for first build
 ```
 
 The test suite (`tests\run.ps1`) is integration-grade — it spins up real containers and checks behaviour end-to-end. Pass `-Build` when iterating on `entrypoint.ps1` so tests run against your local image, not the published one.
+
+## Uninstall
+
+cwc keeps all of its state in three places. Uninstall is just removing those.
+
+```powershell
+# 1. Remove the cwc alias from your PowerShell profile.
+#    install.ps1 added a marker line; this snippet removes the marker + the
+#    Set-Alias line that followed it.
+$marker  = '# claude-win-container alias (managed by install.ps1)'
+$content = Get-Content -LiteralPath $PROFILE -Raw
+$content = $content -replace ('(?ms)\r?\n?' + [regex]::Escape($marker) + '\r?\nSet-Alias cwc .+?\r?\n'), "`r`n"
+Set-Content -LiteralPath $PROFILE -Value $content
+
+# 2. Remove the launcher + per-project sandbox configs + dev/version caches.
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cwc"
+
+# 3. Remove auth tokens + per-project Claude state (sessions, plugins, history).
+Remove-Item -Recurse -Force "$env:USERPROFILE\.claude-win-container"
+
+# 4. Remove the docker images. Lists every cwc image tag you have locally
+#    (latest, dev, preview, version-pinned) and removes them. The image is ~6 GB,
+#    so you'll get the disk back.
+docker images fcostoya/claude-win-container --format '{{.Repository}}:{{.Tag}}' |
+    ForEach-Object { docker image rm $_ }
+```
+
+Open a new PowerShell session to drop the alias from the current shell, then verify: `Get-Command cwc -ErrorAction SilentlyContinue` should return nothing.
+
+**Things this does NOT remove** (intentional):
+
+- The Windows Server Core base image (`mcr.microsoft.com/windows/servercore:ltsc2019` or `:ltsc2022`). Other Windows containers on your machine likely share it — remove manually if you're sure nothing else needs it: `docker image rm mcr.microsoft.com/windows/servercore:ltsc2019`.
+- Docker Desktop / Windows-containers mode itself.
+- Anything an agent committed to your project workspaces. Those are *your* repos; cwc didn't put them there.
+
+**Does harden change uninstall?** No. Harden is purely per-project (a boolean in `~/.cwc/projects/<slug>/config.json`) plus an in-container watchdog Job that exists only for the duration of a session. Nothing on your host outside `~/.cwc/`. Step 2 above wipes all of it.
 
 ## Troubleshooting
 

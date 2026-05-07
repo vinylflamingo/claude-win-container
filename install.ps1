@@ -25,7 +25,9 @@
 #
 # -Ref accepts:
 #   latest                  most-recent stable GitHub release (default; skips preview/*)
-#   v1.2.3                  exact release tag
+#   preview                 most-recent preview build (single moving GitHub release
+#                           with literal tag `preview`; updated on every preview push)
+#   v1.2.3                  exact stable release tag
 #   main / release/x.y.z    branch ref (raw.githubusercontent.com fallback for dev)
 
 [CmdletBinding()]
@@ -39,10 +41,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Resolve a download URL for one file. Three modes, chosen by the shape of $Ref:
+# Resolve a download URL for one file. Four modes, chosen by the shape of $Ref:
 #   - 'latest'       -> GitHub release "latest" redirect (skips prereleases). Asset
 #                       names are flat (no directories), so we use $AssetName.
-#   - tag like v*    -> specific GitHub release. Same flat asset namespace.
+#   - 'preview'      -> the single moving GitHub release with literal tag `preview`,
+#                       always pointing at the most recent preview build. Same flat
+#                       asset namespace.
+#   - tag like v*    -> specific GitHub release (stable). Same flat asset namespace.
 #   - branch ref     -> raw.githubusercontent.com fallback. Preserves the in-repo
 #                       path via $RelPath -- useful for testing an unreleased branch.
 function Get-CwcDownloadUrl {
@@ -53,6 +58,8 @@ function Get-CwcDownloadUrl {
     )
     if ($Ref -eq 'latest') {
         return "https://github.com/vinylflamingo/claude-win-container/releases/latest/download/$AssetName"
+    } elseif ($Ref -eq 'preview') {
+        return "https://github.com/vinylflamingo/claude-win-container/releases/download/preview/$AssetName"
     } elseif ($Ref -match '^v\d+\.\d+\.\d+') {
         return "https://github.com/vinylflamingo/claude-win-container/releases/download/$Ref/$AssetName"
     } else {

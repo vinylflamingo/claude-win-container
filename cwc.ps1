@@ -579,13 +579,26 @@ function Get-CwcImageClassification([string]$image) {
     if ($tag -eq 'latest' -or $tag -match '^latest(-ltsc\d+)?$') {
         return [pscustomobject]@{ kind = 'latest-tag'; version = $null; tag = $tag }
     }
+    # Moving preview pointer (`:preview`, `:preview-ltsc2019`, `:preview-ltsc2022`).
+    # No version info embedded -- the underlying build's version is whatever was
+    # most recently pushed.
+    if ($tag -eq 'preview' -or $tag -match '^preview(-ltsc\d+)?$') {
+        return [pscustomobject]@{ kind = 'preview-moving'; version = $null; tag = $tag }
+    }
     # Strip our base-image suffix (e.g. '0.1.1-ltsc2019' -> '0.1.1') so semver
     # comparisons work uniformly. CI publishes both base-suffixed and bare tags.
     $semverPart = $tag -replace '-ltsc\d+$', ''
-    # Preview/prerelease detection: the semver pre-release segment after the
-    # major.minor.patch (-rc.1, -alpha, -beta.2, -preview, -pre, etc.).
-    if ($semverPart -match '^\d+\.\d+\.\d+-(rc|alpha|beta|preview|pre)') {
-        return [pscustomobject]@{ kind = 'preview'; version = $semverPart; tag = $tag }
+    # SHA-pinned preview build (`0.1.1.d9cd72`, `0.1.1.d9cd72-ltsc2019`). CI's
+    # current convention is 6 hex chars, but accept any hex sequence to stay
+    # tolerant of future format changes.
+    if ($semverPart -match '^(\d+\.\d+\.\d+)\.[0-9a-f]+$') {
+        return [pscustomobject]@{ kind = 'preview-pinned'; version = $Matches[1]; tag = $tag }
+    }
+    # Legacy preview/prerelease semver segment: `0.1.1-rc.1`, `2.0.0-alpha`, etc.
+    # Kept for backward compat -- the project's current preview convention is the
+    # SHA-pinned form above, but third-party forks or older tags may use this.
+    if ($semverPart -match '^(\d+\.\d+\.\d+)-(rc|alpha|beta|preview|pre)') {
+        return [pscustomobject]@{ kind = 'preview-pinned'; version = $Matches[1]; tag = $tag }
     }
     if ($semverPart -match '^\d+\.\d+\.\d+$') {
         return [pscustomobject]@{ kind = 'stable'; version = $semverPart; tag = $tag }
@@ -1977,8 +1990,13 @@ switch ($cwcClass.kind) {
         $bannerText  = "[cwc] image: $cwcImage (latest stable)"
         $bannerColor = 'Green'
     }
-    'preview' {
-        $bannerText  = "[cwc] image: $cwcImage (preview / pre-release)"
+    'preview-moving' {
+        $bannerText  = "[cwc] image: $cwcImage (preview build, latest)"
+        $bannerColor = 'Magenta'
+    }
+    'preview-pinned' {
+        $verNote = if ($cwcClass.version) { " of $($cwcClass.version)" } else { '' }
+        $bannerText  = "[cwc] image: $cwcImage (preview build${verNote}, pinned)"
         $bannerColor = 'Magenta'
     }
     'stable' {

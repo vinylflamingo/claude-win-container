@@ -18,19 +18,23 @@ The install URL is stable across releases — `releases/latest/download/<asset>`
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-Ref <ref>` | `latest` | What to install. `latest` = most-recent stable release. A tag like `v1.2.3` = that exact release. A branch ref like `main` or `release/0.1.0` = raw files from that branch (dev / pre-release validation). |
+| `-Ref <ref>` | `latest` | What to install. `latest` = most-recent stable release. `preview` = most-recent preview build (single moving GitHub release with literal tag `preview`, updated on every preview push). A tag like `v1.2.3` = that exact stable release. A branch ref like `main` or `release/0.1.0` = raw files from that branch (dev / pre-release validation). |
 | `-InstallDir <path>` | `%USERPROFILE%\.cwc` | Where to drop the launcher and config files. |
 | `-LocalSource <path>` | (none) | Copy files from a local repo path instead of downloading from GitHub. Useful for development. |
 | `-NoProfileEdit` | (off) | Skip writing the `cwc` alias to `$PROFILE`. |
 | `-Test` | (off) | Run end-to-end in an isolated sandbox: redirects `USERPROFILE` to a temp dir, defaults `LocalSource` to the script's own directory, leaves `$PROFILE` alone, and cleans everything up on exit. No permanent changes. |
 
 ```powershell
-# Pin to a specific release tag. Install.ps1 is also published as a release
-# asset, so the bootstrap URL and -Ref both point at the same tag.
+# Pin to a specific stable release tag. Install.ps1 is also published as a
+# release asset, so the bootstrap URL and -Ref both point at the same tag.
 $args = @('-Ref','v1.2.3')
 irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1 | iex
 
-# Install from a branch (dev / pre-release validation)
+# Install the latest preview build (moving GitHub release tagged `preview`).
+$args = @('-Ref','preview')
+irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1 | iex
+
+# Install from a branch (dev / pre-release validation -- raw.githubusercontent.com)
 $args = @('-Ref','main')
 irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
 
