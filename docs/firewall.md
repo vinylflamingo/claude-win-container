@@ -27,14 +27,18 @@ You'll see this banner on every session start when the lockdown is active:
 
 ## Managing the lockdown — `cwc firewall`
 
-The launcher edits a persistent user-wide config at `%USERPROFILE%\.cwc\config.json`. Settings apply on the next `cwc` session (no rebuild, no restart of anything).
+`cwc firewall` is **per-project** for everything except `denylist`. It edits the current project's config at `~/.cwc/projects/<slug>/config.json` (where `<slug>` is `Get-ProjectSlug` of the project's absolute path). Settings apply on the next `cwc` session in **that** project — no rebuild, no restart of anything. A subnet allowed in project A is NOT allowed in project B.
+
+The exception is `cwc firewall denylist`, which is **global** (security policy applied to every project) and stored at `~/.cwc/config.json`. See the [Denylist](#denylist-for-host-add) section below.
+
+Run from inside a project root. The subcommands refuse with "no cwc config for this project yet — run `cwc setup` first" when the project hasn't been configured.
 
 ```powershell
-cwc firewall list                       # show current state and allow-list
-cwc firewall allow 192.168.50.0/24      # re-allow a specific subnet
+cwc firewall list                       # show current state and allow-list (this project)
+cwc firewall allow 192.168.50.0/24      # re-allow a specific subnet (this project)
 cwc firewall allow 10.5.0.0/16          # add as many as needed
 cwc firewall deny 192.168.50.0/24       # remove from the allow-list
-cwc firewall disable                    # turn the lockdown off entirely
+cwc firewall disable                    # turn the lockdown off entirely (this project)
 cwc firewall enable                     # turn it back on (default)
 ```
 
@@ -57,9 +61,9 @@ $env:CWC_ALLOW_NETS = '192.168.50.0/24,10.5.0.0/16'
 cwc
 ```
 
-`CWC_*` keys are deliberately **NOT** read from the project's `.env` any more. They control sandbox behaviour, and the agent has RW on the workspace — letting `.env` drive them would let the agent silently disable the lockdown on the next launch. Persistent settings go through `cwc firewall ...` (which writes `~/.cwc/config.json`); one-shot overrides go through shell env. See [`security.md`](./security.md) for the rationale.
+`CWC_*` keys are deliberately **NOT** read from the project's `.env` any more. They control sandbox behaviour, and the agent has RW on the workspace — letting `.env` drive them would let the agent silently disable the lockdown on the next launch. Persistent settings go through `cwc firewall ...` (which writes the per-project config at `~/.cwc/projects/<slug>/config.json`); one-shot overrides go through shell env. See [`security.md`](./security.md) for the rationale.
 
-Precedence: shell env wins → falls back to `cwc firewall`-managed user config → falls back to defaults.
+Precedence: shell env wins → falls back to the per-project config → falls back to global defaults from `~/.cwc/config.json` → falls back to built-in defaults (lockdown on, harden off).
 
 ## Reaching services on the Docker host
 
@@ -100,7 +104,7 @@ cwc firewall denylist reset                        # clear customs, restore defa
 The denylist is enforced at **two layers** as defense-in-depth:
 
 1. `cwc firewall host-add` checks at config-write time, refusing to persist a denylisted entry.
-2. The container entrypoint checks again at hosts-file-write time, skipping any entry that matches — useful if `~/.cwc/config.json` was hand-edited or if `CWC_EXTRA_HOSTS` was set in the shell directly.
+2. The container entrypoint checks again at hosts-file-write time, skipping any entry that matches — useful if a per-project config (`~/.cwc/projects/<slug>/config.json`) was hand-edited or if `CWC_EXTRA_HOSTS` was set in the shell directly.
 
 To add an FQDN to your own denylist that's not Anthropic-related (corporate auth, banking, anything you don't want the agent to be able to redirect), use `cwc firewall denylist add` and it'll be enforced the same way.
 

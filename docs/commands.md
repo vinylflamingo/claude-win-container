@@ -10,7 +10,7 @@ Every command and flag supported by `cwc` and the installer, with a short descri
 irm https://github.com/vinylflamingo/claude-win-container/releases/latest/download/install.ps1 | iex
 ```
 
-Downloads `cwc.ps1`, `docker-compose.yml`, and the overlay example into `%USERPROFILE%\.cwc\`, then adds a `cwc` alias to your PowerShell `$PROFILE`. Idempotent — re-running updates files in place.
+Downloads `cwc.ps1`, `docker-compose.yml`, and the overlay example into `%USERPROFILE%\.cwc\`, then adds a `cwc` alias to your PowerShell `$PROFILE`. Idempotent — re-running updates files in place. The installer no longer runs a configuration wizard; per-project sandbox config is collected by `cwc setup` (auto-triggered on first `cwc` in a new project).
 
 The install URL is stable across releases — `releases/latest/download/<asset>` always redirects to the most recent stable GitHub release (preview/* releases are flagged as prereleases and skipped). Older versions used a `raw.githubusercontent.com/.../main/...` URL that pulled from the `main` branch directly; that's no longer required.
 
@@ -18,22 +18,23 @@ The install URL is stable across releases — `releases/latest/download/<asset>`
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-Ref <ref>` | `latest` | What to install. `latest` = most-recent stable release. A tag like `v1.2.3` = that exact release. A branch ref like `main` or `release/0.1.0` = raw files from that branch (dev / pre-release validation). |
+| `-Ref <ref>` | `latest` | What to install. `latest` = most-recent stable release. `preview` = most-recent preview build (single moving GitHub release with literal tag `preview`, updated on every preview push). A tag like `v1.2.3` = that exact stable release. A branch ref like `main` or `release/0.1.0` = raw files from that branch (dev / pre-release validation). |
 | `-InstallDir <path>` | `%USERPROFILE%\.cwc` | Where to drop the launcher and config files. |
 | `-LocalSource <path>` | (none) | Copy files from a local repo path instead of downloading from GitHub. Useful for development. |
 | `-NoProfileEdit` | (off) | Skip writing the `cwc` alias to `$PROFILE`. |
-| `-SkipFirewallSetup` | (off) | Skip the interactive firewall wizard. |
-| `-Test` | (off) | Run end-to-end in an isolated sandbox: redirects `USERPROFILE` to a temp dir, defaults `LocalSource` to the script's own directory, leaves `$PROFILE` alone, and cleans everything up on exit. Walk the wizard, see your config.json dumped at the end, no permanent changes. |
+| `-Test` | (off) | Run end-to-end in an isolated sandbox: redirects `USERPROFILE` to a temp dir, defaults `LocalSource` to the script's own directory, leaves `$PROFILE` alone, and cleans everything up on exit. No permanent changes. |
 
 ```powershell
-# Pin to a specific release tag. Install.ps1 is also published as a release
-# asset, so the bootstrap URL and -Ref both point at the same tag.
-$args = @('-Ref','v1.2.3')
-irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1 | iex
+# Pin to a specific stable release tag. Install.ps1 is also published as a
+# release asset, so the bootstrap URL and -Ref both point at the same tag.
+# `irm | iex` can't pass parameters, so use the scriptblock form to forward -Ref:
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/v1.2.3/install.ps1))) -Ref v1.2.3
 
-# Install from a branch (dev / pre-release validation)
-$args = @('-Ref','main')
-irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1 | iex
+# Install the latest preview build (moving GitHub release tagged `preview`).
+& ([scriptblock]::Create((irm https://github.com/vinylflamingo/claude-win-container/releases/download/preview/install.ps1))) -Ref preview
+
+# Install from a branch (dev / pre-release validation -- raw.githubusercontent.com)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/install.ps1))) -Ref main
 
 # Test the installer locally without touching your real config
 .\install.ps1 -Test
@@ -49,7 +50,105 @@ irm https://raw.githubusercontent.com/vinylflamingo/claude-win-container/main/in
 cwc
 ```
 
-Runs `claude` inside the container against the current directory. First run pulls the image (`fcostoya/claude-win-container:latest`) from Docker Hub if it isn't local. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
+Runs `claude` inside the container against the current directory. First run pulls the image from Docker Hub if it isn't local. The default tag follows the install channel recorded in `~/.cwc/config.json` (`channel: stable` → `:latest`; `channel: preview` → `:preview`); set `$env:CWC_IMAGE` to override. Project-root heuristic must pass (directory must contain `.git`, `package.json`, `*.sln`, `.mcp.json`, `pyproject.toml`, `go.mod`, or `Cargo.toml` — bypass with `-Force`).
+
+If the current project has no config (`~/.cwc/projects/<slug>/config.json`), `cwc` auto-triggers `cwc setup` inline before launching. Non-interactive sessions fail closed with a "run `cwc setup` first" message — the wizard requires a real terminal.
+
+### `cwc setup`
+
+```powershell
+cwc setup
+```
+
+Per-project setup wizard. Walks 6 questions and writes `~/.cwc/projects/<slug>/config.json`:
+
+1. (informational) Public internet — always allowed.
+2. **LAN subnets** — CIDRs to re-allow through the lockdown.
+3. **Host services** — comma-separated TCP ports to expose. The hostname `host` is always registered to point at the Docker host's vNIC, with the listed ports opened. The agent reaches services as `http://host:<port>`. Optional extra hostnames (e.g. `api.test`) share the same port list.
+4. **Custom FQDN → IP** — explicit hostname-to-IP mappings (e.g. `legacy.box → 10.5.1.20`). RFC1918 addresses auto-add a containing `/24` to allow_nets.
+5. **Folder mounts** — additional bind mounts at `C:\docs\<name>` (RO by default).
+6. **Harden** — toggle the in-container watchdog for this project. Default ON.
+
+The wizard requires an interactive session. `cwc setup` is also auto-triggered by `cwc` on first invocation in a project with no config. Re-run anytime to reconfigure (it offers to keep the existing config or replace it).
+
+### `cwc dev [args...]`
+
+```powershell
+cwc dev                       # launch claude in the :dev image (build if missing)
+cwc dev powershell            # drop to a shell in the :dev container
+cwc dev mcp list              # any normal cwc command works under `dev`
+```
+
+**Session-scoped dev mode.** Runs against a local `:dev` image built from the Dockerfile next to `cwc.ps1`. Each `cwc dev` invocation explicitly opts in — leaving puts you back in normal mode. There's no persistent "I'm in dev now" toggle to forget about.
+
+Falls through to the main launcher flow with `$env:CWC_IMAGE` rebound to `:dev`, so trust checks, the per-project setup wizard, env forwarding, mounts, and harden all still apply.
+
+**Requires a clone.** `cwc dev` errors out if there's no Dockerfile next to `cwc.ps1` — the published install drops only the launcher files, so there's nothing to build from. Clone the repo and either set `Set-Alias cwc <clone>\cwc.ps1` for the session or rebind `$PROFILE`.
+
+**Refuses host-side wrappers.** `cwc dev firewall list`, `cwc dev mount add`, etc. fail with "no `dev` wrapper needed" since those subcommands don't start a container. Use `cwc firewall list` directly.
+
+```powershell
+[cwc dev] running with fcostoya/claude-win-container:dev
+```
+
+is printed in magenta on every dev session so you always know which image you're hitting.
+
+### `cwc dev build`
+
+```powershell
+cwc dev build
+```
+
+`docker compose build claude-code` against the `:dev` tag. First build is ~5–10 minutes; subsequent builds are layer-cached. Requires a clone.
+
+### `cwc dev rebuild`
+
+```powershell
+cwc dev rebuild
+```
+
+Removes the `:dev` image then runs `docker compose build --no-cache claude-code`. Useful when the layer cache is stale or you suspect a build problem. Requires a clone.
+
+### `cwc dev clean`
+
+```powershell
+cwc dev clean
+```
+
+`docker image rm` the `:dev` image. Idempotent — no-op if `:dev` isn't present. Doesn't touch `~/.cwc/dev.json` or your flag settings.
+
+### `cwc dev status`
+
+```powershell
+cwc dev status
+```
+
+Prints:
+- The `:dev` image tag the launcher uses (always `fcostoya/claude-win-container:dev`).
+- Whether the image exists locally (and a hint to run `cwc dev build` if not).
+- Whether the launcher is running from a clone, and the clone path.
+- The current value of every dev flag, marked `(default)` or `(custom)`.
+
+### `cwc dev flag {list|set|unset}`
+
+```powershell
+cwc dev flag list                                       # show all flags + values + defaults
+cwc dev flag set live_entrypoint_mount on               # turn on
+cwc dev flag set live_entrypoint_mount off              # turn off
+cwc dev flag unset live_entrypoint_mount                # reset to default
+```
+
+Flag values persist at `~/.cwc/dev.json` and apply to every `cwc dev` session until you change them. The dev *mode* is session-scoped; only the flag *settings* persist.
+
+`cwc dev flag set` accepts `on|off|true|false|1|0|yes|no|y|n` (case-insensitive) for the value.
+
+**Available flags:**
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `live_entrypoint_mount` | `off` | Bind-mount the clone's `entrypoint.ps1` over `C:\entrypoint.ps1` inside the `:dev` container (read-only). Edits to `entrypoint.ps1` take effect on the next `cwc dev` with no rebuild — turns the entrypoint iteration loop from minutes to seconds. **Caveat:** flip off (or do a normal `cwc`) when you want to test the baked-in image behavior. |
+
+Adding a new flag is a one-line entry in `$script:cwcDevFlagDefaults` in `cwc.ps1` plus per-flag application logic in the dev session block — see [`docs/development.md`](./development.md).
 
 ### `cwc <command> [args...]`
 
@@ -130,7 +229,13 @@ Bypass the project-root heuristic. The launcher normally refuses to run in a dir
 
 ## `cwc firewall` — LAN-egress lockdown
 
-Manages a persistent user-wide config at `%USERPROFILE%\.cwc\config.json`. Settings apply on the next `cwc` session — no rebuild needed.
+**Per-project**, except `denylist` (global).
+
+`cwc firewall {list, allow, deny, enable, disable, host-list, host-add, host-remove}` operate on the current project's config at `%USERPROFILE%\.cwc\projects\<slug>\config.json`. Run from inside a project root. They refuse with "no cwc config for this project yet — run `cwc setup` first" if the project hasn't been configured.
+
+`cwc firewall denylist` is **global** (security policy applied to every project) and stored at `%USERPROFILE%\.cwc\config.json`. It's usable from anywhere.
+
+Settings apply on the next `cwc` session in that project — no rebuild needed.
 
 The lockdown blocks outbound traffic to RFC1918 ranges (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`) and IPv6 link-local / ULA. Public internet is unaffected. See [firewall.md](./firewall.md) for mechanics and threat model.
 
@@ -214,7 +319,9 @@ Remove a mapping. The `hosts` file inside the next session won't include it.
 
 ## `cwc trust` — workspace policy file trust
 
-Three files in your project drive what flows into the next session — `claude-sandbox.overlay.yml`, `.env`, `.mcp.json`. The agent has RW on the workspace, so any of these can be agent-edited. The trust system tracks a per-project SHA-256 of each and refuses to launch when they change without explicit ack. See [`security.md`](./security.md) for the threat model.
+**Per-project.** Trust state lives in the per-project config at `~/.cwc/projects/<slug>/config.json` under `trusted_files`.
+
+Three files in your project drive what flows into the next session — `claude-sandbox.overlay.yml`, `.env`, `.mcp.json`. The agent has RW on the workspace, so any of these can be agent-edited. The trust system tracks per-project SHA-256 hashes and refuses to launch when they change without explicit ack. See [`security.md`](./security.md) for the threat model.
 
 ### `cwc trust`
 
@@ -222,7 +329,7 @@ Three files in your project drive what flows into the next session — `claude-s
 cwc trust                  # trust the current state of all tracked files in this project
 ```
 
-Records SHA-256 hashes of the tracked files into `~/.cwc/config.json` under `trusted_files["<project-slug>"]`. Run this after legitimately editing one of the tracked files to dismiss the launch-time prompt.
+Records SHA-256 hashes of the tracked files into the project's `trusted_files` map. Run this after legitimately editing one of the tracked files to dismiss the launch-time prompt.
 
 ### `cwc trust list`
 
@@ -255,7 +362,9 @@ Per-project state (sessions, plugins, settings overlay) is unaffected by `auth r
 
 ## `cwc harden` — tamper-resistant in-container hardening
 
-Opt-in. When enabled, the container runs an in-container watchdog every 2 seconds that re-applies blackhole routes, restores the hosts file from snapshot if changed, removes unauthorized `/32` allow-routes to RFC1918, and logs new trust-store CAs. Off by default — turn on if you want a higher bar against agent tampering. Not real isolation; see [`security.md`](./security.md) for the trade-offs.
+**Per-project.** Each project's harden state is stored at `~/.cwc/projects/<slug>/config.json` and applies only to sessions launched from that project. `cwc harden enable` in project A does NOT enable harden in project B.
+
+Opt-in. When enabled, the container runs an in-container watchdog every 2 seconds that re-applies blackhole routes, restores the hosts file from snapshot if changed, removes unauthorized `/32` allow-routes to RFC1918, and logs new trust-store CAs. The wizard recommends ON; you can toggle later. Not real isolation; see [`security.md`](./security.md) for the trade-offs.
 
 ```powershell
 cwc harden enable          # turn on; takes effect on next 'cwc' session
@@ -267,9 +376,11 @@ cwc harden status          # show state + what gets enforced + the limitations
 
 ## `cwc mount` — extra folder mounts
 
+**Per-project.** Operates on the current project's config at `~/.cwc/projects/<slug>/config.json`. Refuses with "run `cwc setup` first" if the project isn't configured.
+
 Mount additional folders from your host into the container. Common use cases: an Obsidian vault, design-spec folders, runbooks, anything claude should be able to read but isn't part of the project workspace.
 
-Each mount is named. Inside the container, mounts land at a predictable path: `C:\docs\<name>`. Read-only is the default. Persisted in the same `~/.cwc/config.json` as firewall settings.
+Each mount is named. Inside the container, mounts land at a predictable path: `C:\docs\<name>`. Read-only is the default. A mount added in project A is NOT visible in project B.
 
 ### `cwc mount list`
 
@@ -313,11 +424,12 @@ All read by the launcher and/or the entrypoint. Setting them in your shell or yo
 
 | Variable | Description |
 | --- | --- |
-| `CWC_IMAGE` | Pin a specific image. Default: `fcostoya/claude-win-container:latest`. |
+| `CWC_IMAGE` | Pin a specific image. Default: `fcostoya/claude-win-container:latest` for stable installs, `:preview` for preview installs (driven by the `channel` field in `~/.cwc/config.json`, written by `install.ps1`). |
 | `CWC_LOCKDOWN_LAN` | `1` (default) enables the LAN lockdown; `0` disables it. |
 | `CWC_ALLOW_NETS` | Comma-separated CIDRs to re-allow (e.g. `192.168.50.0/24,10.5.0.0/16`). Merged with the user-wide allow-list. |
 | `CWC_EXTRA_HOSTS` | Pipe-separated `fqdn|target|port,port` entries joined by `;` (e.g. `cm.local|host-gateway|443,80;db|10.5.1.20|5432`). Set automatically by `cwc firewall host-add`. |
 | `CWC_HARDEN` | `1` enables the in-container watchdog; `0` (default) disables. |
+| `CWC_SKIP_VERSION_CHECK` | `1` suppresses the GitHub-API call that drives the launch banner's "is this the latest stable?" check. The banner still prints, just without the freshness comparison. Useful in CI / offline environments. |
 
 ```powershell
 # One-off override in the current shell:

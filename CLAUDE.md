@@ -103,6 +103,8 @@ The test harness clears a list of "cwc-managed" env vars between tests (`$script
 
 I learned this the hard way; it cost two test re-runs to find.
 
+**Exception:** env vars that the harness sets *globally for the whole suite* (not per-test) shouldn't be in the cleanup list. `CWC_SKIP_VERSION_CHECK` is an example — the harness sets it once at load time so the launch banner's GitHub-API check never runs during tests. If it were in the cleanup list, the cleanup would unset it between tests and the next launch would hit the API. Two patterns, two purposes; don't conflate them.
+
 ### 8. Embedding JSON in `Invoke-InContainer` test commands is unreliable.
 
 The test runner pipes commands through PowerShell → docker → PowerShell argv. Each layer can mangle quotes. **Single-quoted JSON literals embedded in a `-Command` string are particularly fragile** — quotes get eaten by some intermediate parser.
@@ -131,8 +133,8 @@ If a container test starts behaving as if your entrypoint change isn't there, `-
 
 1. Read [`docs/security.md`](./docs/security.md) for the threat model if you're touching anything sandbox-adjacent.
 2. Make changes.
-3. Run host-only tests for fast feedback: `.\tests\run.ps1 -Filter 'denylist|trust'` (~10 seconds).
-4. If you touched the entrypoint or Dockerfile: `.\tests\run.ps1 -Build` (~5–8 minutes).
+3. Run host-only tests for fast feedback: `.\tests\run.ps1 -Filter 'dev|denylist|trust|project-isolation|setup'` (~2 seconds; 29 tests).
+4. If you touched the entrypoint or Dockerfile: `.\tests\run.ps1 -Build` (~5–8 minutes). For the inner loop on `entrypoint.ps1`, use `cwc dev` with `live_entrypoint_mount` set on — edits take effect on next launch with no rebuild.
 5. Update docs:
    - New / changed user command → [`docs/commands.md`](./docs/commands.md).
    - New / changed network behaviour → [`docs/firewall.md`](./docs/firewall.md).
@@ -145,10 +147,12 @@ If a container test starts behaving as if your entrypoint change isn't there, `-
 ## Things to know about the codebase
 
 - **Function definitions in `cwc.ps1` are hoisted to the top.** `Get-ProjectSlug` and the trust helpers used to live mid-file — I moved them up so the trust subcommand can use them. If you add a helper, put it in the helpers section near the top.
-- **Subcommand dispatch in `cwc.ps1` uses `if ($Cmd[0] -eq 'foo')` chains, not a single `switch`.** Each block ends with `exit 0`. Order matters only for which one runs first (none of them overlap by design).
-- **Read-CwcConfig has side effects.** It populates default `host_denylist` if the field is missing (existing configs from before the denylist feature). It also detects and migrates `extra_hosts` from the old string-target schema to the new `{target, ports}` schema (in-memory). The save happens later in the launcher's main flow, with a one-time banner.
-- **Launcher banner output is filtered by `Invoke-InContainer`.** Lines starting with `[cwc]` and the `Project:`/`State:`/`Auth:`/`Command:`/`Forwarded:` summary block are stripped before assertions see them. Use `[cwc]` prefix for user-facing entrypoint banners; user-facing entrypoint *errors* should use a different prefix (or the test harness will silently swallow them).
-- **`docker-compose.yml` is shipped to the user**. It lives next to `cwc.ps1` in `~/.cwc/`. Changes to it ship via the installer or `cwc -Pull`. If you add a new bind mount or env var here, the launcher needs to know how to set the corresponding compose-substitution variable.
+- **Subcommand dispatch in `cwc.ps1` uses `if ($Cmd[0] -eq 'foo')` chains, not a single `switch`.** Most blocks end with `exit 0` — they handle the subcommand fully and stop. The exception is `cwc dev` (session-launch path): it sets `$env:CWC_IMAGE`, builds `:dev` if missing, applies dev flags, strips `'dev'` from `$Cmd`, and **falls through** to the main launcher flow. That's deliberate — dev mode is just a different image, not a different code path. If you add a subcommand that should run *as if it were `cwc <command>` but with extra setup*, follow the dev pattern (set state, modify `$Cmd`, fall through). Otherwise stick to the `exit 0` pattern.
+- **Config is split into global + per-project.** `~/.cwc/config.json` holds only the global denylist + defaults block. Per-project state (`lockdown_lan`, `harden_enabled`, `allow_nets`, `extra_hosts`, `mounts`, `trusted_files`) lives at `~/.cwc/projects/<slug>/config.json`, where `<slug>` is `Get-ProjectSlug` of the project's absolute path. The four config helpers — `Read-CwcGlobalConfig`, `Write-CwcGlobalConfig`, `Read-CwcProjectConfig`, `Write-CwcProjectConfig` — replace the old `Read-CwcConfig`/`Write-CwcConfig`. **Read-CwcProjectConfig returns `$null` when the project has no config yet** — that's the signal for the auto-setup wizard. Subcommands that mutate per-project state use `Get-RequiredCwcProjectConfig` which exits with an actionable error when there's no config.
+- **`cwc dev` is session-scoped, not a persistent toggle.** Each `cwc dev` invocation explicitly opts in. The flag store at `~/.cwc/dev.json` is persistent (so flag settings stick across invocations), but the dev *mode* itself isn't. Adding a new dev flag: one entry in `$script:cwcDevFlagDefaults` plus per-flag handling in the dev session block (currently only `live_entrypoint_mount` exists, used as a template). Dev mode requires running from a clone (Dockerfile next to `cwc.ps1`); `Test-CwcInClone` is the gate.
+- **Launch banner is filtered by `Invoke-InContainer`.** Lines starting with `[cwc]` and the `Project:`/`State:`/`Auth:`/`Command:`/`Forwarded:` summary block are stripped before assertions see them. Use `[cwc]` prefix for user-facing entrypoint banners; user-facing entrypoint *errors* should use a different prefix (or the test harness will silently swallow them). The new `[cwc] image: <tag> (...)` version banner is also filtered out.
+- **Version banner does a network call** (24h-cached at `~/.cwc/version-cache.json`). Tests bypass it via `CWC_SKIP_VERSION_CHECK=1`, set globally by the harness. If you change anything about the banner's external dependencies (URL, response shape), update both `Get-CwcLatestStableVersion` and the cache schema.
+- **`docker-compose.yml` is shipped to the user**. It lives next to `cwc.ps1` in `~/.cwc/`. Changes to it ship via the installer or by re-running `irm releases/latest/download/install.ps1`. If you add a new bind mount or env var here, the launcher needs to know how to set the corresponding compose-substitution variable.
 - **The image is large (~6 GB)**. Server Core base + Node + Claude Code. Don't add packages casually; document in the Dockerfile if you do.
 - **`IMPLEMENTATION_PLAN.md` is historical**. It captured the original v1 design before the security overhaul. It does not reflect current state. Read [`docs/security.md`](./docs/security.md) for current state. (TODO: archive or rewrite.)
 
@@ -170,8 +174,11 @@ A reference for diagnosing test breakage:
 Several docs describe overlapping concepts. When updating one, check the others for stale references:
 
 - **Network model**: `cwc.ps1` (firewall subcommand) ↔ `entrypoint.ps1` (CWC_EXTRA_HOSTS parser) ↔ `docs/firewall.md` ↔ `docs/security.md` (defense layers 2 & 3) ↔ `docs/commands.md` (env vars table) ↔ `README.md` (Common workflows + State and isolation).
-- **Trust system**: `cwc.ps1` (trust helpers + main-flow trust check) ↔ `docs/security.md` (defense layer 4) ↔ `docs/commands.md` (cwc trust section) ↔ `docs/per-project-setup.md` (Trust system section) ↔ `README.md` (Troubleshooting first item).
+- **Per-project config split**: `cwc.ps1` (config helpers, subcommand gates, main-flow auto-setup) ↔ `docs/security.md` ("Sandbox config split" section) ↔ `docs/commands.md` (per-subcommand "per-project" labels + `cwc setup` section) ↔ `docs/firewall.md` ("Managing the lockdown" section) ↔ `docs/per-project-setup.md` ("First-time setup: cwc setup") ↔ `README.md` (Quickstart) ↔ `tests/lib/harness.ps1` (`Set-CwcConfig` writes both global + per-project) ↔ `tests/run.ps1` (snapshots whole `~/.cwc/` tree).
+- **Trust system**: `cwc.ps1` (trust helpers + main-flow trust check) ↔ `docs/security.md` (defense layer 4) ↔ `docs/commands.md` (cwc trust section) ↔ `docs/per-project-setup.md` (Trust system section) ↔ `README.md` (Troubleshooting first item). Trust state moved out of the global slug-keyed map into each project's `trusted_files` field — `Save-CwcProjectTrust` and `Get-CwcProjectTrustState` operate on the per-project config now.
 - **Auth bind**: `entrypoint.ps1` (settings merge + delta) ↔ `docs/security.md` (Cross-project state).
-- **Harden**: `cwc.ps1` (harden subcommand + env forwarding) ↔ `entrypoint.ps1` (watchdog block) ↔ `docs/security.md` (defense layer 5) ↔ `docs/commands.md` (cwc harden section) ↔ `install.ps1` (Q6 wizard offer) ↔ `README.md` (Common workflows).
+- **Harden**: `cwc.ps1` (harden subcommand + env forwarding, per-project) ↔ `entrypoint.ps1` (watchdog block) ↔ `docs/security.md` (defense layer 5) ↔ `docs/commands.md` (cwc harden section) ↔ `cwc.ps1` (Q6 of `Invoke-CwcProjectSetup`) ↔ `README.md` (Common workflows).
+- **`cwc dev`**: `cwc.ps1` (`0ba` subcommand block + `$script:cwcDevExtraMounts` injection in main-flow mountFlags) ↔ `docs/development.md` ("cwc dev" section) ↔ `docs/commands.md` (`cwc dev` + management subcommand sections) ↔ `docs/security.md` ("cwc dev and the threat model" section) ↔ `tests/dev.tests.ps1` ↔ `README.md` (Working on cwc itself: cwc dev).
+- **Launch banner / version check**: `cwc.ps1` (`Get-CwcImageClassification`, `Get-CwcLatestStableVersion`, banner block before session summary) ↔ `docs/commands.md` (`CWC_SKIP_VERSION_CHECK` row in env-vars table) ↔ `tests/lib/harness.ps1` (sets `CWC_SKIP_VERSION_CHECK=1` globally).
 
 When in doubt, search for the keyword across `*.md` files before changing one.

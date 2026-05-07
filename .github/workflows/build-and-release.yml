@@ -64,9 +64,12 @@ jobs:
 
           if [[ "$BRANCH" == release/* ]]; then
             VERSION="${BRANCH#release/}"
-            # Strict semver for releases: 1.2.3, 1.2.3-rc.1, 1.2.3+build.5, etc.
+            # Strict semver: 1.2.3 (and technically 1.2.3-suffix / 1.2.3+build are
+            # accepted by the regex too, but project convention is plain x.y.z --
+            # preview and release for the same version use the SAME tag, so there's
+            # no need for an -rc.N / -beta suffix scheme).
             if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$ ]]; then
-              echo "::error::release/* branches must use a semver suffix (got '$VERSION'). Examples: release/1.0.1, release/1.0.1-rc.1, release/2.0.0+build.5"
+              echo "::error::release/* branches must use a semver version (got '$VERSION'). Examples: release/1.0.1, release/2.0.0"
               exit 1
             fi
             BRANCH_KIND="release"
@@ -75,10 +78,17 @@ jobs:
           elif [[ "$BRANCH" == preview/* ]]; then
             # Preview accepts any suffix; sanitise for Docker tag rules
             # (replace / with -; valid Docker tag chars: [a-zA-Z0-9._-]).
-            # Convention is semver-with-prerelease-suffix (1.0.1-rc.1) so it
-            # composes with release tags cleanly, but ad-hoc names work too.
+            # Convention: branch is preview/<x.y.z> using the version you intend to
+            # ship as stable. We append .<short-sha> to the version so each preview
+            # push produces unique SHA-pinned Docker tags (:0.1.1.d9cd72) -- multiple
+            # preview pushes for the same x.y.z don't clobber each other on the
+            # registry. Separately, the build job pushes a moving :preview Docker
+            # tag and the release job upserts a single GitHub release with the
+            # literal tag `preview` -- both always point at the most recent build.
             VERSION="${BRANCH#preview/}"
             VERSION="${VERSION//\//-}"
+            SHORT_SHA="${GITHUB_SHA:0:6}"
+            VERSION="${VERSION}.${SHORT_SHA}"
             BRANCH_KIND="preview"
             IS_RELEASE="false"
             IS_PUBLISHABLE="true"
@@ -182,10 +192,12 @@ jobs:
       - name: Run host-only tests
         shell: pwsh
         run: |
-          # Host-only test subset — exercises cwc.ps1 directly, no Docker.
-          # Container-side tests (network, settings-merge, harden) require the
-          # built image and are not in CI; run them locally via .\tests\run.ps1 -Build.
-          .\tests\run.ps1 -Filter 'denylist|trust'
+          # Host-only test subset -- exercises cwc.ps1 directly, no Docker.
+          # Mirrors the local "fast suite" documented in CLAUDE.md (~2s, 29 tests).
+          # Container-side tests (network, settings-merge, harden, filesystem,
+          # auth) require the built image and are not in CI; run them locally
+          # via .\tests\run.ps1 -Build when iterating on entrypoint.ps1.
+          .\tests\run.ps1 -Filter 'dev|denylist|trust|project-isolation|setup'
 
   build:
     name: Build (${{ matrix.base.tag }})
@@ -239,9 +251,10 @@ jobs:
         run: |
           docker push ${{ env.IMAGE_NAME }}:${{ needs.classify.outputs.version }}-${{ matrix.base.tag }}
 
-      # Bare-semver tag (e.g. `1.0.1` or `1.0.1-rc.1`) for ltsc2019 only —
-      # ltsc2019 is the "default" base. Pushed for both release and preview so
-      # users can pull a specific preview by exact tag.
+      # Bare-semver tag (e.g. `1.0.1`) for ltsc2019 only -- ltsc2019 is the
+      # "default" base. Pushed for both release and preview so users can pull a
+      # specific version by exact tag, regardless of whether it's currently a
+      # preview or a stable release.
       - name: Push bare-version alias
         if: needs.classify.outputs.is_publishable == 'true' && matrix.base.tag == 'ltsc2019'
         shell: pwsh
@@ -272,6 +285,28 @@ jobs:
               docker push "${img}:latest"
           }
 
+      # `preview`, `preview-ltsc2019`, `preview-ltsc2022` are the moving "newest
+      # preview build" pointers. Each preview push overwrites them. Users who want
+      # the latest preview without knowing the SHA pull `:preview`. SHA-pinned
+      # tags (`:0.1.1.d9cd72`, etc.) stay around as historical artifacts on Docker
+      # Hub. Released stable builds never touch these.
+      - name: Push `preview` moving tags (preview only)
+        if: needs.classify.outputs.branch_kind == 'preview'
+        shell: pwsh
+        run: |
+          $version  = '${{ needs.classify.outputs.version }}'
+          $baseTag  = '${{ matrix.base.tag }}'
+          $img      = '${{ env.IMAGE_NAME }}'
+          $sourceRef = "${img}:${version}-${baseTag}"
+
+          docker tag $sourceRef "${img}:preview-${baseTag}"
+          docker push "${img}:preview-${baseTag}"
+
+          if ($baseTag -eq 'ltsc2019') {
+              docker tag $sourceRef "${img}:preview"
+              docker push "${img}:preview"
+          }
+
   release:
     name: Create GitHub release
     needs: [classify, build]
@@ -300,17 +335,26 @@ jobs:
       # `prerelease: true` for preview branches → GitHub shows a yellow badge
       # and excludes it from "Latest release" on the repo page.
       #
+      # Tag naming differs by branch kind:
+      #   release/x.y.z  → tag `vx.y.z` (one stable release per version, preserved)
+      #   preview/x.y.z  → tag `preview` (literal string, single moving GitHub
+      #                    release that softprops upserts on each preview push;
+      #                    the SHA-suffixed version goes in the release name/body
+      #                    so testers can see what's behind the moving pointer)
+      # SHA-pinned Docker tags (:0.1.1.d9cd72, etc.) preserve historical previews
+      # on Docker Hub, but the GitHub release surface is single-pointer to keep
+      # the install URL `releases/download/preview/install.ps1` stable.
+      #
       # `files:` attaches the launcher files as release assets so users can
-      # install via the stable URL `releases/latest/download/install.ps1` instead
-      # of pinning a branch. GitHub's `releases/latest` redirect skips
-      # prerelease entries, so preview/* releases publish assets but don't
-      # become the "latest" install target. Asset names are flat (no dirs);
+      # install via stable URLs (`releases/latest/download/install.ps1` for the
+      # most recent stable, `releases/download/preview/install.ps1` for the most
+      # recent preview). Asset names are flat (no dirs);
       # `overlays/project-overlay.example.yml` lands as `project-overlay.example.yml`.
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.classify.outputs.version }}
-          name: v${{ needs.classify.outputs.version }}
+          tag_name: ${{ needs.classify.outputs.branch_kind == 'preview' && 'preview' || format('v{0}', needs.classify.outputs.version) }}
+          name: ${{ needs.classify.outputs.branch_kind == 'preview' && format('Preview {0}', needs.classify.outputs.version) || format('v{0}', needs.classify.outputs.version) }}
           body_path: release-body.md
           target_commitish: ${{ github.sha }}
           prerelease: ${{ needs.classify.outputs.branch_kind == 'preview' }}

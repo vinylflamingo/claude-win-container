@@ -58,13 +58,16 @@ if ($Build) {
     Write-Host "Built $cwcLocal" -ForegroundColor Green
 }
 
-# Snapshot real user config
-$realCfg  = Join-Path $env:USERPROFILE '.cwc\config.json'
-$savedCfg = $null
-if (Test-Path $realCfg) {
-    $savedCfg = "$realCfg.test-backup-$(Get-Date -Format 'yyyyMMddHHmmss')"
-    Copy-Item $realCfg $savedCfg -Force
-    Write-Host "Snapshotted real config to $savedCfg" -ForegroundColor DarkGray
+# Snapshot the entire ~/.cwc/ tree -- the new per-project layout means tests can
+# write to ~/.cwc/projects/<slug>/config.json too, not just the global config.json.
+# We move the whole tree aside (rather than copying) so tests start with a clean
+# slate, then move it back on cleanup.
+$cwcRoot      = Join-Path $env:USERPROFILE '.cwc'
+$cwcRootSaved = $null
+if (Test-Path $cwcRoot) {
+    $cwcRootSaved = "$cwcRoot.test-backup-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Move-Item $cwcRoot $cwcRootSaved -Force
+    Write-Host "Snapshotted real ~/.cwc to $cwcRootSaved" -ForegroundColor DarkGray
 }
 
 # Fixtures: a workspace dir + RO and RW mount sources
@@ -124,11 +127,11 @@ try {
     }
 
     if (-not $NoCleanup) {
-        # Restore config
-        Remove-Item $realCfg -ErrorAction SilentlyContinue
-        if ($savedCfg) {
-            Move-Item $savedCfg $realCfg -Force
-            Write-Host "Restored real ~/.cwc/config.json from snapshot" -ForegroundColor DarkGray
+        # Restore ~/.cwc tree
+        if (Test-Path $cwcRoot) { Remove-Item -Recurse -Force $cwcRoot }
+        if ($cwcRootSaved) {
+            Move-Item $cwcRootSaved $cwcRoot -Force
+            Write-Host "Restored real ~/.cwc from snapshot" -ForegroundColor DarkGray
         }
         # Restore image env
         if ($null -ne $savedImage) { $env:CWC_IMAGE = $savedImage } else { Remove-Item Env:CWC_IMAGE -ErrorAction SilentlyContinue }
@@ -137,7 +140,7 @@ try {
     } else {
         Write-Host ""
         Write-Host "(-NoCleanup) Fixtures kept at $fixturesRoot" -ForegroundColor Yellow
-        if ($savedCfg) { Write-Host "(-NoCleanup) Config snapshot at $savedCfg" -ForegroundColor Yellow }
+        if ($cwcRootSaved) { Write-Host "(-NoCleanup) ~/.cwc snapshot at $cwcRootSaved" -ForegroundColor Yellow }
     }
 }
 
