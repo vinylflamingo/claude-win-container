@@ -141,20 +141,32 @@ Per-project config is created by `cwc setup`. The first time you run `cwc` in a 
 
 `cwc auth reset` wipes the shared auth dir cleanly when you want to start fresh.
 
+## Adversarial validation: the CTF suite
+
+The integration suite (`tests/run.ps1`) verifies that the defense layers above are wired correctly — that the firewall blocks what it claims to, that bind mounts expose only what they should. That catches what we knew to test for.
+
+The CTF suite (`tests/ctf/`) is the complement: it spawns Claude Code as an adversarial agent told to break out of the sandbox and capture planted flags. A leak there is a real shipping bug — the suite tests the same defaults a user gets, not a hardened CI-only config. Architecture and design is in [`ctf-suite.md`](./ctf-suite.md); operational reference is in [`tests/ctf/README.md`](../tests/ctf/README.md).
+
+Currently the suite ships one scenario (`host-file-exfil`, exercising defense layer 1's bind-mount boundary). LAN-blocked and external-deny scenarios are planned next.
+
 ## Future work: host-side enforcement
 
-The strongest defense against agent-with-admin would be enforcement on the host, outside the container's reach. We investigated three paths during the design phase ([spike scripts](../tests/spikes/)):
+The strongest defense against agent-with-admin would be enforcement on the host, outside the container's reach. We investigated five paths through a series of empirical spikes (preserved in [`tests/spikes/`](../tests/spikes/)). The full investigation outcome and the recommended alternatives for users who need stronger isolation are written up in [`host-side-enforcement.md`](./host-side-enforcement.md). Headline result:
 
 | Path | Result | Why |
 | --- | --- | --- |
 | Hyper-V Firewall (Win 11 22H2+) | Doesn't see Docker | Docker Desktop's Windows containers don't register a VM creator |
 | Hyper-V VM extended ACLs | Doesn't see Docker | `Get-VM` doesn't enumerate HCS-managed containers |
 | Windows Defender Firewall on the NAT bridge | Doesn't see container egress | VFP intercepts traffic below the WFP firewall layer |
-| HNS / VFP policies | **Viable, not yet built** | This is the layer Docker itself uses; needs `vfpctrl.exe` or HNS module scripting |
+| HNS endpoint policy POST | **Metadata-only, no enforcement** | API accepts the ACL onto the endpoint object; VFP does not reload |
+| HCN `HcnModifyEndpoint` (P/Invoke) | **Metadata-only, no enforcement** | Same outcome on Docker-created endpoints; the modern API doesn't reconcile either |
+| `vfpctrl` direct | **Per-port commands rejected** | `vfpctrl /list-vmswitch-port` works but no per-port modifier ordering accepts `/get-port-state` |
 
-The HNS/VFP path is real but a non-trivial implementation effort with deep ties to Docker Desktop's internals. v1 ships harden as a stronger in-container speed-bump and parks host-side enforcement as a v2 item. If you need real isolation today, the alternatives are:
+The investigation closed NO-GO on Win 11 Pro N build 26200 + Docker Desktop 28.2.2. v1 ships harden as a stronger in-container speed-bump and the v2 host-side-enforcement plan is shelved indefinitely; see the [investigation outcome](./host-side-enforcement.md) for the empirical detail and what would change the result.
 
-- A host-side outbound HTTPS proxy with FQDN allowlist (mitmproxy, squid). Forces all egress through a host-controlled choke point. Complicates setup; requires CA in the container's trust store.
+If you need real isolation today, the recommended alternatives (with concrete setup outlines in [`host-side-enforcement.md`](./host-side-enforcement.md)) are:
+
+- A host-side outbound HTTPS proxy with FQDN allowlist (`mitmproxy`). Forces all egress through a host-controlled choke point. Complicates setup; requires CA in the container's trust store.
 - A separate Windows VM running Docker Desktop, network-isolated at the hypervisor level. Real isolation, biggest setup cost.
 
 ## Quick reference
