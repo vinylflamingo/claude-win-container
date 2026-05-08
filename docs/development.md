@@ -16,6 +16,7 @@ If you're using Claude Code (or any agent) to make changes, also read [`../CLAUD
 | `tests/run.ps1` | Host | Test runner: snapshots `~/.cwc/`, seeds fixtures, auto-discovers `*.tests.ps1` |
 | `tests/lib/harness.ps1` | Host | Shared test helpers — `Set-CwcConfig`, `Invoke-InContainer`, `Invoke-CwcOnHost`, `Should-*` assertions |
 | `tests/spikes/` | Host | One-off design-question scripts; not part of the regular suite |
+| `tests/ctf/` | Host | CTF red-team suite — spawns Claude as adversarial agent, looks for sandbox escapes. Separate runner. See [`ctf-suite.md`](./ctf-suite.md). |
 
 ## Pre-requisites
 

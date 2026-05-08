@@ -13,3 +13,6 @@ Thumbs.db
 
 # Claude Code working files
 .claude/
+
+# CTF suite per-run artifacts (transcripts, milestone logs, planted-file evidence)
+tests/ctf/runs/
